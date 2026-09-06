@@ -8,6 +8,7 @@ from typing import List
 from urllib.parse import parse_qsl
 import json
 import random
+import asyncio
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -336,6 +337,36 @@ async def admin_panel(chat_id: str):
     )
 
 
+broadcast_lock = asyncio.Lock()
+
+
+async def run_broadcast(admin_chat_id: str, broadcast_text: str, photo_id: str | None):
+    async with broadcast_lock:
+        con = db()
+        users = [str(row[0]) for row in con.execute("SELECT telegram_id FROM users ORDER BY started_at ASC").fetchall()]
+        con.close()
+        sent = 0
+        failed = 0
+        keyboard = {"inline_keyboard": [[{"text": "🎡 Открыть колесо", "web_app": {"url": PUBLIC_URL}}]]}
+        for uid in users:
+            if photo_id:
+                payload = {"chat_id": uid, "photo": photo_id, "caption": escape(broadcast_text)[:1024], "reply_markup": keyboard}
+                result = await telegram("sendPhoto", payload)
+            else:
+                payload = {"chat_id": uid, "text": escape(broadcast_text), "reply_markup": keyboard}
+                result = await telegram("sendMessage", payload)
+            if result and result.get("ok"):
+                sent += 1
+            else:
+                failed += 1
+                # Telegram может вернуть 429 при слишком быстрой рассылке.
+                if result and result.get("parameters", {}).get("retry_after"):
+                    await asyncio.sleep(min(int(result["parameters"]["retry_after"]), 10))
+            # Безопасный темп, чтобы не упираться в лимиты Telegram.
+            await asyncio.sleep(0.10)
+        await telegram("sendMessage", {"chat_id": admin_chat_id, "text": f"📣 Рассылка завершена.\n\n✅ Доставлено: {sent}\n⚠️ Не доставлено: {failed}\n👥 Всего получателей: {len(users)}"})
+
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
     secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "workspb2026")
@@ -394,25 +425,10 @@ async def telegram_webhook(request: Request):
             if not broadcast_text and not photo_id:
                 await telegram("sendMessage", {"chat_id": chat_id, "text": "📣 Формат:\n\n1) /broadcast текст\n\nили\n\n2) Прикрепи фото и в подписи напиши:\n/broadcast текст\n\nК сообщению автоматически добавится кнопка «🎡 Открыть колесо»."})
             else:
-                con = db()
-                users = [str(row[0]) for row in con.execute("SELECT telegram_id FROM users ORDER BY started_at ASC").fetchall()]
-                con.close()
-                sent = 0
-                failed = 0
-                keyboard = {"inline_keyboard": [[{"text": "🎡 Открыть колесо", "web_app": {"url": PUBLIC_URL}}]]}
-                for uid in users:
-                    if photo_id:
-                        payload = {"chat_id": uid, "photo": photo_id, "caption": escape(broadcast_text)[:1024], "reply_markup": keyboard}
-                        result = await telegram("sendPhoto", payload)
-                    else:
-                        payload = {"chat_id": uid, "text": escape(broadcast_text), "reply_markup": keyboard}
-                        result = await telegram("sendMessage", payload)
-                    if result and result.get("ok"):
-                        sent += 1
-                    else:
-                        failed += 1
-                    await asyncio.sleep(0.05)
-                await telegram("sendMessage", {"chat_id": chat_id, "text": f"📣 Рассылка завершена.\n\n✅ Доставлено: {sent}\n⚠️ Не доставлено: {failed}\n👥 Всего получателей: {len(users)}"})
+                # Важно: webhook должен ответить Telegram сразу. Иначе Telegram повторяет
+                # один и тот же update, пока длинная рассылка ещё выполняется.
+                asyncio.create_task(run_broadcast(str(chat_id), broadcast_text, photo_id))
+                await telegram("sendMessage", {"chat_id": chat_id, "text": "📣 Рассылка запущена. Отправляю сообщение пользователям и пришлю итоговый отчёт после завершения."})
     elif chat_id and text.startswith("/paysupport"):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "💳 По вопросам оплаты Stars и возврата средств напишите администратору: @RZTFrong"})
     elif chat_id and text.startswith("/admin"):
