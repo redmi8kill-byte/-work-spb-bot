@@ -81,6 +81,7 @@ def db():
         con.execute("ALTER TABLE orders ADD COLUMN status TEXT DEFAULT 'new'")
     con.execute("UPDATE orders SET status='new' WHERE status IS NULL OR status=''")
     con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    con.execute("CREATE TABLE IF NOT EXISTS users (telegram_id TEXT PRIMARY KEY, first_name TEXT DEFAULT '', last_name TEXT DEFAULT '', username TEXT DEFAULT '', started_at TEXT NOT NULL, last_seen TEXT NOT NULL)")
     con.commit()
     return con
 
@@ -116,6 +117,24 @@ def format_order(order_id, chosen, total, contact, comment):
         lines.append(f"• {escape(s['name'])} — {s['price']:,} ₽".replace(",", " "))
     lines += ["", f"💰 <b>Итого: {total:,} ₽</b>".replace(",", " "), f"👤 <b>Контакт:</b> {escape(contact) if contact else 'не указан'}", f"💬 <b>Комментарий:</b> {escape(comment) if comment else 'нет'}"]
     return "\n".join(lines)
+
+
+def save_started_user(user: dict):
+    telegram_id = str(user.get("id") or "").strip()
+    if not telegram_id:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    first_name = str(user.get("first_name") or "").strip()
+    last_name = str(user.get("last_name") or "").strip()
+    username = str(user.get("username") or "").strip()
+    con = db()
+    con.execute(
+        "INSERT INTO users(telegram_id,first_name,last_name,username,started_at,last_seen) VALUES(?,?,?,?,?,?) "
+        "ON CONFLICT(telegram_id) DO UPDATE SET first_name=excluded.first_name,last_name=excluded.last_name,username=excluded.username,last_seen=excluded.last_seen",
+        (telegram_id, first_name, last_name, username, now, now),
+    )
+    con.commit()
+    con.close()
 
 
 async def setup_webhook():
@@ -276,6 +295,7 @@ async def telegram_webhook(request: Request):
         else:
             await telegram("sendMessage", {"chat_id": chat_id, "text": "❌ Неверный код подключения."})
     elif chat_id and text.startswith("/start"):
+        save_started_user(msg.get("from") or {"id": chat_id})
         await telegram("sendMessage", {"chat_id": chat_id, "text": "👋 Добро пожаловать! Нажмите «🛍 Услуги» в меню, чтобы открыть каталог."})
     elif chat_id and text.startswith("/help"):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "🏙 <b>ПРАЙС — размещение вакансий в Санкт-Петербурге</b>\n\n🛍 <b>Услуги</b> — открыть каталог и выбрать тариф.\n📋 Выберите услуги, добавьте их в корзину и отправьте заявку.\n⚡ Быстрая публикация • 📣 продвижение вакансии • 🤖 AI-оформление\n\nЕсли нужна помощь, напишите администратору.", "parse_mode": "HTML"})
@@ -345,6 +365,21 @@ async def admin_me(request: Request):
     return {"ok": True, "admin": is_telegram_admin(request)}
 
 
+@app.get("/api/admin/users")
+async def admin_users(request: Request):
+    if not is_telegram_admin(request):
+        return JSONResponse({"ok": False, "message": "Нет доступа"}, status_code=403)
+    con = db()
+    rows = con.execute(
+        "SELECT telegram_id,first_name,last_name,username,started_at,last_seen FROM users ORDER BY started_at DESC LIMIT 500"
+    ).fetchall()
+    con.close()
+    users=[]
+    for uid,first,last,username,started,last_seen in rows:
+        users.append({"telegram_id":uid,"first_name":first or "Пользователь","last_name":last or "","username":username or "","started_at":started,"last_seen":last_seen})
+    return {"ok":True,"users":users,"total":len(users)}
+
+
 @app.get("/api/admin/dashboard")
 async def admin_dashboard(request: Request):
     if not is_telegram_admin(request):
@@ -379,12 +414,13 @@ def admin_stats():
     new_orders=con.execute("SELECT COUNT(*) FROM orders WHERE status='new'").fetchone()[0]
     in_progress=con.execute("SELECT COUNT(*) FROM orders WHERE status='in_progress'").fetchone()[0]
     done=con.execute("SELECT COUNT(*) FROM orders WHERE status='done'").fetchone()[0]
+    user_count=con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     rows=con.execute("SELECT id,created_at,service_ids,total,contact,comment,status FROM orders ORDER BY id DESC LIMIT 100").fetchall()
     con.close()
     orders=[]
     for oid,created,ids,total,contact,comment,status in rows:
         orders.append({"id":oid,"created_at":created,"services":service_names(ids),"total":total,"contact":contact or "—","comment":comment or "—","status":status or "new"})
-    return {"total_orders":total_orders,"total_revenue":total_revenue,"today_orders":today_orders,"today_revenue":today_revenue,"new_orders":new_orders,"in_progress":in_progress,"done":done,"orders":orders}
+    return {"total_orders":total_orders,"total_revenue":total_revenue,"today_orders":today_orders,"today_revenue":today_revenue,"new_orders":new_orders,"in_progress":in_progress,"done":done,"user_count":user_count,"orders":orders}
 
 ADMIN_LOGIN_HTML = """<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Вход — Админ-панель</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at 20% 10%,#eaf1ff,transparent 35%),radial-gradient(circle at 90% 20%,#f5eaff,transparent 35%),#f7faff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#14213d}.box{width:min(410px,calc(100% - 32px));background:#fff;border:1px solid #dce6f5;border-radius:28px;padding:28px;box-shadow:0 25px 70px #18315a18}.logo{font-weight:950;font-size:18px}.logo span{display:inline-grid;place-items:center;width:38px;height:38px;margin-right:8px;border-radius:12px;background:linear-gradient(135deg,#246bff,#7b4dff);color:#fff}.box h1{font-size:28px;margin:24px 0 8px}.muted{color:#71809a;font-size:13px;line-height:1.5}label{display:block;margin:22px 0 7px;font-size:12px;font-weight:800}input{width:100%;box-sizing:border-box;border:1px solid #d7e1ef;border-radius:15px;padding:14px;background:#f9fbff;font-size:16px}button{width:100%;border:0;border-radius:15px;padding:14px;margin-top:14px;background:linear-gradient(135deg,#1268ff,#704cff);color:#fff;font-weight:900;font-size:15px}.error{margin-top:12px;padding:11px;border-radius:12px;background:#fff0f2;color:#b52c51;font-size:12px}</style></head><body><form class='box' method='post' action='/admin-web/login'><div class='logo'><span>✦</span>Работа в Питере</div><h1>Админ-панель</h1><div class='muted'>Закрытый раздел управления заказами и статистикой.</div><label>Код администратора</label><input type='password' name='code' placeholder='Введите код' required autofocus><button>Войти в панель →</button>{error}</form></body></html>"""
 
@@ -455,8 +491,7 @@ button,input,textarea,select{font:inherit}button{cursor:pointer}.app{max-width:6
 .sum{margin-top:12px;border:1px solid #28455c;background:#071827;border-radius:19px;padding:17px}.sumline{display:flex;justify-content:space-between;margin:7px 0;color:#aeb9c7}.sumline.total{font-size:20px;color:var(--gold2);font-weight:950;border-top:1px solid var(--line);padding-top:13px;margin-top:12px}
 .form{display:grid;gap:10px}.form input,.form textarea,.form select{width:100%;border:1px solid #29455d;background:#071827;color:#fff;border-radius:13px;padding:13px;outline:none}.form textarea{min-height:90px;resize:vertical}
 .profileHead{display:flex;align-items:center;gap:13px;padding:18px;border:1px solid var(--line);border-radius:19px;background:linear-gradient(120deg,#0c2236,#071522)}.avatar{width:54px;height:54px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(135deg,#caa45c,#ffe7a5);color:#091321;font-size:22px;font-weight:950}.profileName{font-weight:950}.muted{color:#91a0b1;font-size:11px}.profileList{margin-top:10px;border:1px solid var(--line);border-radius:18px;background:#071827;overflow:hidden}.profileItem{display:flex;align-items:center;justify-content:space-between;padding:15px;border-bottom:1px solid var(--line)}.profileItem:last-child{border:0}.profileItem b{font-size:12px}.profileItem small{display:block;color:#7f90a4;margin-top:3px}
-.empty{padding:28px 16px;text-align:center;color:#8293a6;border:1px dashed #2b465d;border-radius:17px}.adminHero{border:1px solid #4b4967;background:linear-gradient(135deg,#101f31,#121027 55%,#071321);border-radius:22px;padding:19px;box-shadow:0 0 30px #8b5cff10,inset 0 0 30px #42e8ff05}.lock{font-size:26px;color:var(--gold)}.adminHero h2{margin:8px 0 4px}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}.stat{border:1px solid var(--line);background:#071827;border-radius:15px;padding:13px}.stat small{color:#7f91a5;font-size:9px}.stat b{display:block;font-size:20px;margin-top:5px;color:var(--gold2)}.adminActions{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px}.adminAction{border:1px solid var(--line);background:#071827;color:#d9e3ee;border-radius:14px;padding:13px 5px;text-align:center;font-size:9px}.adminAction strong{display:block;color:var(--gold);font-size:18px;margin-bottom:4px}.orderAdmin{border:1px solid #203b52;background:#071827;border-radius:16px;padding:13px}.orderTop{display:flex;justify-content:space-between;gap:10px}.orderMeta{color:#8192a5;font-size:9px;margin-top:3px}.status{font-size:9px;font-weight:950;padding:6px 8px;border-radius:999px;white-space:nowrap}.s-new{background:#f5d38a;color:#071321}.s-in_progress{background:#285eaa;color:#dcecff}.s-done{background:#1d744d;color:#dcffed}.s-cancelled{background:#7b3040;color:#ffe3e8}.orderInfo{margin-top:9px;color:#b5c1ce;font-size:10px;line-height:1.55}.orderControls{display:flex;gap:6px;margin-top:10px}.orderControls select{flex:1;border:1px solid #2a455d;background:#0a1d2f;color:#fff;border-radius:10px;padding:8px;font-size:10px}.orderControls button{border:0;border-radius:10px;background:var(--gold);color:#071321;font-weight:950;padding:8px 11px;font-size:10px}
-.bottom{position:fixed;z-index:50;left:50%;transform:translateX(-50%);bottom:9px;width:min(590px,calc(100% - 18px));padding:7px;border:1px solid #29485f;border-radius:22px;background:rgba(4,10,18,.91);backdrop-filter:blur(22px);box-shadow:0 15px 45px #000b,0 0 28px #42e8ff0d;display:flex;gap:3px}.nav{flex:1;border:0;background:transparent;color:#7f91a6;border-radius:15px;padding:8px 3px 7px;font-size:8px;font-weight:800}.nav .ico{display:block;font-size:17px;margin-bottom:3px}.nav.active{background:linear-gradient(135deg,#102c42,#1b1740);color:#fff0a8;box-shadow:inset 0 0 18px #42e8ff0b}.nav.admin{color:#ffd76a;text-shadow:0 0 10px #ffd76a44}.toast{position:fixed;z-index:80;left:50%;transform:translateX(-50%);bottom:90px;width:min(500px,calc(100% - 30px));padding:13px 15px;border-radius:14px;background:#10273a;border:1px solid #31516b;color:#fff;text-align:center;font-size:12px;display:none}
+.empty{padding:28px 16px;text-align:center;color:#8293a6;border:1px dashed #2b465d;border-radius:17px}.adminHero{border:1px solid #4b4967;background:linear-gradient(135deg,#101f31,#121027 55%,#071321);border-radius:22px;padding:19px;box-shadow:0 0 30px #8b5cff10,inset 0 0 30px #42e8ff05}.lock{font-size:26px;color:var(--gold)}.adminHero h2{margin:8px 0 4px}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}.stat{border:1px solid var(--line);background:#071827;border-radius:15px;padding:13px}.stat small{color:#7f91a5;font-size:9px}.stat b{display:block;font-size:20px;margin-top:5px;color:var(--gold2)}.adminActions{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px}.adminAction{border:1px solid var(--line);background:#071827;color:#d9e3ee;border-radius:14px;padding:13px 5px;text-align:center;font-size:9px}.adminAction strong{display:block;color:var(--gold);font-size:18px;margin-bottom:4px}.orderAdmin{border:1px solid #203b52;background:#071827;border-radius:16px;padding:13px}.orderTop{display:flex;justify-content:space-between;gap:10px}.orderMeta{color:#8192a5;font-size:9px;margin-top:3px}.status{font-size:9px;font-weight:950;padding:6px 8px;border-radius:999px;white-space:nowrap}.s-new{background:#f5d38a;color:#071321}.s-in_progress{background:#285eaa;color:#dcecff}.s-done{background:#1d744d;color:#dcffed}.s-cancelled{background:#7b3040;color:#ffe3e8}.orderInfo{margin-top:9px;color:#b5c1ce;font-size:10px;line-height:1.55}.orderControls{display:flex;gap:6px;margin-top:10px}.orderControls select{flex:1;border:1px solid #2a455d;background:#0a1d2f;color:#fff;border-radius:10px;padding:8px;font-size:10px}.orderControls button{border:0;border-radius:10px;background:var(--gold);color:#071321;font-weight:950;padding:8px 11px;font-size:10px}.usersPanel{margin-top:14px}.userCard{display:flex;align-items:center;gap:11px;border:1px solid #203b52;background:#071827;border-radius:16px;padding:12px}.userAvatar{width:38px;height:38px;flex:0 0 38px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(135deg,#42e8ff,#8b5cff);color:#fff;font-weight:950}.userMain{min-width:0;flex:1}.userMain b{display:block;font-size:11px}.userMain small{display:block;color:#8192a5;font-size:9px;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.userDate{color:#8f9db0;font-size:9px;text-align:right}.bottom{position:fixed;z-index:50;left:50%;transform:translateX(-50%);bottom:9px;width:min(590px,calc(100% - 18px));padding:7px;border:1px solid #29485f;border-radius:22px;background:rgba(4,10,18,.91);backdrop-filter:blur(22px);box-shadow:0 15px 45px #000b,0 0 28px #42e8ff0d;display:flex;gap:3px}.nav{flex:1;border:0;background:transparent;color:#7f91a6;border-radius:15px;padding:8px 3px 7px;font-size:8px;font-weight:800}.nav .ico{display:block;font-size:17px;margin-bottom:3px}.nav.active{background:linear-gradient(135deg,#102c42,#1b1740);color:#fff0a8;box-shadow:inset 0 0 18px #42e8ff0b}.nav.admin{color:#ffd76a;text-shadow:0 0 10px #ffd76a44}.toast{position:fixed;z-index:80;left:50%;transform:translateX(-50%);bottom:90px;width:min(500px,calc(100% - 30px));padding:13px 15px;border-radius:14px;background:#10273a;border:1px solid #31516b;color:#fff;text-align:center;font-size:12px;display:none}
 @media(min-width:700px){.app{max-width:1100px}.view{padding:20px}.hero{min-height:520px;padding:40px}.hero h1{font-size:50px}.cards{gap:14px}.card{padding:18px}.bottom{width:min(650px,calc(100% - 30px))}}@media(max-width:380px){.hero h1{font-size:33px}.features{grid-template-columns:repeat(2,1fr)}.cards{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.adminActions{grid-template-columns:repeat(2,1fr)}}
 </style>
 </head>
@@ -474,7 +509,7 @@ button,input,textarea,select{font:inherit}button{cursor:pointer}.app{max-width:6
 
 <section id="checkout" class="view"><div class="sectionTitle"><div><h2>Оформление заявки</h2><span id="checkoutChosen">Выбранные услуги</span></div></div><div class="form"><input id="contact" placeholder="Ваш Telegram / телефон" autocomplete="off"><textarea id="comment" placeholder="Комментарий (необязательно)"></textarea><button class="btn gold full" onclick="sendOrder()">Отправить заявку →</button></div><div id="result"></div></section>
 
-<section id="admin" class="view"><div class="adminHero"><div class="lock">♛</div><h2>Админ-панель</h2><div class="muted">Только для владельца сервиса</div><div class="stats"><div class="stat"><small>Сегодня</small><b id="aToday">0</b><small>заявок</small></div><div class="stat"><small>Всего</small><b id="aTotal">0</b><small>заявок</small></div><div class="stat"><small>Выручка</small><b id="aRevenue">0 ₽</b><small>за всё время</small></div></div></div><div class="adminActions"><button class="adminAction" onclick="loadAdmin()"><strong>↻</strong>Обновить</button><button class="adminAction" onclick="filterAdmin('new')"><strong id="aNew">0</strong>Новые</button><button class="adminAction" onclick="filterAdmin('in_progress')"><strong id="aWork">0</strong>В работе</button><button class="adminAction" onclick="filterAdmin('done')"><strong id="aDone">0</strong>Выполнено</button></div><div class="sectionTitle"><h2>Последние заказы</h2><span>до 100</span></div><div id="adminOrders" class="list"></div></section>
+<section id="admin" class="view"><div class="adminHero"><div class="lock">♛</div><h2>Админ-панель</h2><div class="muted">Только для владельца сервиса</div><div class="stats"><div class="stat"><small>Сегодня</small><b id="aToday">0</b><small>заявок</small></div><div class="stat"><small>Всего</small><b id="aTotal">0</b><small>заявок</small></div><div class="stat"><small>Выручка</small><b id="aRevenue">0 ₽</b><small>за всё время</small></div></div></div><div class="adminActions"><button class="adminAction" onclick="loadAdmin()"><strong>↻</strong>Обновить</button><button class="adminAction" onclick="filterAdmin('new')"><strong id="aNew">0</strong>Новые</button><button class="adminAction" onclick="filterAdmin('in_progress')"><strong id="aWork">0</strong>В работе</button><button class="adminAction" onclick="filterAdmin('done')"><strong id="aDone">0</strong>Выполнено</button><button class="adminAction" onclick="showUsers()"><strong id="aUsers">0</strong>Пользователи</button></div><div id="usersPanel" class="usersPanel" style="display:none"><div class="sectionTitle"><h2>Пользователи</h2><span id="usersTotal">0 запустили бота</span></div><div id="adminUsers" class="list"></div></div><div class="sectionTitle"><h2>Последние заказы</h2><span>до 100</span></div><div id="adminOrders" class="list"></div></section>
 </div>
 
 <nav class="bottom"><button class="nav active" data-go="home"><span class="ico">⌂</span>Главная</button><button class="nav" data-go="tariffs"><span class="ico">◎</span>Тарифы</button><button class="nav" data-go="packages"><span class="ico">◇</span>Пакеты</button><button class="nav" data-go="cart"><span class="ico">🛒</span>Корзина <span id="navCount"></span></button><button class="nav" data-go="profile"><span class="ico">♙</span>Профиль</button><button class="nav admin" id="adminNav" data-go="admin" style="display:none"><span class="ico">♛</span>Админка</button></nav>
@@ -497,7 +532,23 @@ function showHistory(){const h=document.getElementById('history');if(!orders.len
 function showHow(){showToast('Выберите тариф → заполните контакт → отправьте заявку → менеджер свяжется с вами.')}
 function openSupport(){const url='https://t.me/RZTFrong';try{if(tg&&typeof tg.openTelegramLink==='function'){tg.openTelegramLink(url);return}}catch(e){}window.location.href=url;}
 async function checkAdmin(){try{const r=await fetch('/api/admin/me',{headers:apiHeaders()});const d=await r.json();if(d.admin){document.getElementById('adminNav').style.display='block';return true}}catch(e){}return false}
-async function loadAdmin(){if(!initData){showToast('Админка доступна только внутри Telegram');return}try{const r=await fetch('/api/admin/dashboard',{headers:apiHeaders()});if(!r.ok){showToast('Нет доступа');return}const d=await r.json();adminData=d.data;document.getElementById('aToday').textContent=adminData.today_orders;document.getElementById('aTotal').textContent=adminData.total_orders;document.getElementById('aRevenue').textContent=rub(adminData.total_revenue);document.getElementById('aNew').textContent=adminData.new_orders;document.getElementById('aWork').textContent=adminData.in_progress;document.getElementById('aDone').textContent=adminData.done;renderAdminOrders()}catch(e){showToast('Не удалось загрузить админку')}}
+async function loadAdmin(){if(!initData){showToast('Админка доступна только внутри Telegram');return}try{const r=await fetch('/api/admin/dashboard',{headers:apiHeaders()});if(!r.ok){showToast('Нет доступа');return}const d=await r.json();adminData=d.data;document.getElementById('aToday').textContent=adminData.today_orders;document.getElementById('aTotal').textContent=adminData.total_orders;document.getElementById('aRevenue').textContent=rub(adminData.total_revenue);document.getElementById('aNew').textContent=adminData.new_orders;document.getElementById('aWork').textContent=adminData.in_progress;document.getElementById('aDone').textContent=adminData.done;document.getElementById('aUsers').textContent=adminData.user_count||0;renderAdminOrders()}catch(e){showToast('Не удалось загрузить админку')}}
+async function showUsers(){
+  const panel=document.getElementById('usersPanel');
+  panel.style.display='block';
+  const box=document.getElementById('adminUsers');
+  box.innerHTML='<div class="empty">Загрузка пользователей…</div>';
+  try{
+    const r=await fetch('/api/admin/users',{headers:apiHeaders()});
+    if(!r.ok){box.innerHTML='<div class="empty">Нет доступа</div>';return}
+    const d=await r.json();
+    document.getElementById('usersTotal').textContent=`${d.total} запустили бота`;
+    document.getElementById('aUsers').textContent=d.total;
+    if(!d.users.length){box.innerHTML='<div class="empty">Пока никто не запускал бота через /start.</div>';return}
+    box.innerHTML=d.users.map(u=>{const name=esc((u.first_name||'Пользователь')+(u.last_name?' '+u.last_name:''));const uname=u.username?'@'+esc(u.username):'без username';const date=u.started_at?new Date(u.started_at).toLocaleString('ru-RU'):'—';const initial=esc((u.first_name||'П').slice(0,1).toUpperCase());return `<div class="userCard"><div class="userAvatar">${initial}</div><div class="userMain"><b>${name}</b><small>${uname} · ID ${esc(u.telegram_id)}</small></div><div class="userDate">${date}<br><span style="color:var(--cyan)">/start</span></div></div>`}).join('');
+  }catch(e){box.innerHTML='<div class="empty">Не удалось загрузить пользователей.</div>'}
+}
+
 function filterAdmin(f){adminFilter=f;renderAdminOrders()}function renderAdminOrders(){const box=document.getElementById('adminOrders');if(!adminData){box.innerHTML='<div class="empty">Загрузка…</div>';return}let rows=adminData.orders;if(adminFilter!=='all')rows=rows.filter(o=>o.status===adminFilter);if(!rows.length){box.innerHTML='<div class="empty">Заказов в этом разделе нет.</div>';return}box.innerHTML=rows.map(o=>{const status=o.status||'new';return `<div class="orderAdmin"><div class="orderTop"><div><b>#${o.id} · ${rub(o.total)}</b><div class="orderMeta">${new Date(o.created_at).toLocaleString('ru-RU')}</div></div><span class="status s-${status}">${({'new':'Новая','in_progress':'В работе','done':'Выполнено','cancelled':'Отменена'})[status]}</span></div><div class="orderInfo"><b>${esc(o.services.join(', '))}</b><br>👤 ${esc(o.contact)}${o.comment&&o.comment!=='—'?'<br>💬 '+esc(o.comment):''}</div><div class="orderControls"><select id="st-${o.id}"><option value="new" ${status==='new'?'selected':''}>Новая</option><option value="in_progress" ${status==='in_progress'?'selected':''}>В работе</option><option value="done" ${status==='done'?'selected':''}>Выполнено</option><option value="cancelled" ${status==='cancelled'?'selected':''}>Отменена</option></select><button onclick="saveStatus(${o.id})">Сохранить</button></div></div>`}).join('')}
 async function saveStatus(id){const status=document.getElementById('st-'+id).value;const r=await fetch('/api/admin/orders/'+id+'/status',{method:'POST',headers:apiHeaders(),body:JSON.stringify({status})});if(!r.ok){showToast('Не удалось изменить статус');return}showToast('Статус заказа обновлён');await loadAdmin()}
 function render(){renderTariffs();renderPackages();renderCart();renderProfile()}document.querySelectorAll('.nav').forEach(b=>b.addEventListener('click',()=>go(b.dataset.go)));(async()=>{try{services=await (await fetch('/api/services')).json();render();await checkAdmin()}catch(e){showToast('Не удалось загрузить каталог')}})();
