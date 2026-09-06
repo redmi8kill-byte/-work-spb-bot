@@ -1,5 +1,4 @@
 import os
-import asyncio
 import sqlite3
 import hmac
 import hashlib
@@ -383,29 +382,6 @@ async def telegram_webhook(request: Request):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "🏙 <b>ПРАЙС — размещение вакансий в Санкт-Петербурге</b>\n\n🛍 <b>Услуги</b> — открыть каталог и выбрать тариф.\n📋 Выберите услуги, добавьте их в корзину и отправьте заявку.\n⚡ Быстрая публикация • 📣 продвижение вакансии • 🤖 AI-оформление\n\nЕсли нужна помощь, напишите администратору.", "parse_mode": "HTML"})
     elif chat_id and text.startswith("/paysupport"):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "💳 По вопросам оплаты Stars и возврата средств напишите администратору: @RZTFrong"})
-    elif chat_id and text.startswith("/broadcast"):
-        if str(chat_id) != str(get_admin_chat_id()):
-            await telegram("sendMessage", {"chat_id": chat_id, "text": "⛔ Команда доступна только администратору."})
-        else:
-            parts = text.split(maxsplit=1)
-            if len(parts) < 2 or not parts[1].strip():
-                await telegram("sendMessage", {"chat_id": chat_id, "text": "📣 Формат: /broadcast текст сообщения\n\nНапример: /broadcast 🎡 Колесо удачи уже доступно! Заходи в мини-приложение и попробуй выиграть приз 🎁"})
-            else:
-                broadcast_text = parts[1].strip()
-                con = db()
-                users = [str(row[0]) for row in con.execute("SELECT telegram_id FROM users ORDER BY started_at ASC").fetchall()]
-                con.close()
-                sent = 0
-                failed = 0
-                for uid in users:
-                    result = await telegram("sendMessage", {"chat_id": uid, "text": escape(broadcast_text)})
-                    if result and result.get("ok"):
-                        sent += 1
-                    else:
-                        failed += 1
-                    # Telegram рекомендует ограничивать массовую рассылку; небольшая пауза снижает риск rate limit.
-                    await asyncio.sleep(0.05)
-                await telegram("sendMessage", {"chat_id": chat_id, "text": f"📣 Рассылка завершена.\n\n✅ Доставлено: {sent}\n⚠️ Не доставлено: {failed}\n👥 Всего получателей: {len(users)}"})
     elif chat_id and text.startswith("/admin"):
         await admin_panel(str(chat_id))
     elif chat_id and text.startswith("/orders"):
@@ -733,7 +709,7 @@ const initData=tg?.initData||'';let services=[],cart=JSON.parse(localStorage.get
 const rub=n=>new Intl.NumberFormat('ru-RU').format(n)+' ₽',byId=id=>services.find(s=>s.id===id);function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}function apiHeaders(){return {'X-Telegram-Init-Data':initData,'Content-Type':'application/json'}}function showToast(msg){const x=document.getElementById('toast');x.textContent=msg;x.style.display='block';clearTimeout(window.__toast);window.__toast=setTimeout(()=>x.style.display='none',2600)}
 async function loadWheel(){try{const r=await fetch('/api/wheel/status',{headers:apiHeaders()});const d=await r.json();if(!r.ok){showToast(d.message||'Откройте приложение в Telegram');return}document.getElementById('wheelBalance').textContent=d.balance+' ⭐';document.getElementById('starBalanceLarge').textContent=d.balance+' ⭐';document.getElementById('wheelNote').textContent=d.free_available?'Сегодня доступна бесплатная попытка.':'Бесплатная попытка уже использована • следующее вращение 5 ⭐.'}catch(e){showToast('Не удалось загрузить баланс')}}
 async function buyStars(stars){try{const r=await fetch('/api/stars/invoice',{method:'POST',headers:apiHeaders(),body:JSON.stringify({stars})});const d=await r.json();if(!r.ok){showToast(d.message||'Не удалось создать счёт');return}if(tg&&typeof tg.openInvoice==='function'){tg.openInvoice(d.invoice_url,status=>{if(status==='paid'){showToast('⭐ Оплата прошла');setTimeout(loadWheel,700)}})}else{window.location.href=d.invoice_url}}catch(e){showToast('Ошибка оплаты Stars')}}
-async function spinWheel(){const btn=document.getElementById('spinBtn');if(btn.disabled)return;btn.disabled=true;try{const r=await fetch('/api/wheel/spin',{method:'POST',headers:apiHeaders(),body:'{}'});const d=await r.json();if(r.status===402&&d.need_stars){btn.disabled=false;showToast('Нужно 5 ⭐ за платное вращение');return}if(!r.ok){btn.disabled=false;showToast(d.message||'Не удалось прокрутить колесо');return}const disk=document.getElementById('wheelDisk');const sectorMap={empty:0,discount10:1,discount20:2,bonus:3,free:4};const sector=sectorMap[d.prize.key]??0;const turns=6+Math.floor(Math.random()*3);const stop=(360-sector*72-36)%360;disk.style.transform=`rotate(${turns*360+stop}deg)`;setTimeout(()=>{document.getElementById('winTitle').textContent=d.prize.title;document.getElementById('winText').textContent=(d.prize.key==='empty'?'🙂 Ничего не выиграно. ': '🎁 Приз сохранён в ваш инвентарь. ')+(d.paid?'Списано 5 ⭐ с баланса.':'Бесплатная попытка использована.');document.getElementById('winEmoji').textContent=d.prize.key==='empty'?'🙂':d.prize.key==='free'?'🎁':'⭐';document.getElementById('winInventoryBtn').style.display=d.inventory_id?'block':'none';document.getElementById('winModal').style.display='grid';btn.disabled=false;loadWheel()},4900)}catch(e){btn.disabled=false;showToast('Ошибка вращения')}}
+async function spinWheel(){const btn=document.getElementById('spinBtn');if(btn.disabled)return;btn.disabled=true;try{const r=await fetch('/api/wheel/spin',{method:'POST',headers:apiHeaders(),body:'{}'});const d=await r.json();if(r.status===402&&d.need_stars){btn.disabled=false;showToast('Нужно 5 ⭐ за платное вращение');return}if(!r.ok){btn.disabled=false;showToast(d.message||'Не удалось прокрутить колесо');return}const disk=document.getElementById('wheelDisk');const sectorMap={empty:0,discount10:1,discount20:2,bonus:3,free:4};const sector=sectorMap[d.prize.key]??0;const turns=6+Math.floor(Math.random()*3);const stop=(270-sector*72)%360;disk.style.transform=`rotate(${turns*360+stop}deg)`;setTimeout(()=>{document.getElementById('winTitle').textContent=d.prize.title;document.getElementById('winText').textContent=(d.prize.key==='empty'?'🙂 Ничего не выиграно. ': '🎁 Приз сохранён в ваш инвентарь. ')+(d.paid?'Списано 5 ⭐ с баланса.':'Бесплатная попытка использована.');document.getElementById('winEmoji').textContent=d.prize.key==='empty'?'🙂':d.prize.key==='free'?'🎁':'⭐';document.getElementById('winInventoryBtn').style.display=d.inventory_id?'block':'none';document.getElementById('winModal').style.display='grid';btn.disabled=false;loadWheel()},4900)}catch(e){btn.disabled=false;showToast('Ошибка вращения')}}
 async function showInventory(){const panel=document.getElementById('inventoryPanel');panel.style.display='block';panel.scrollIntoView({behavior:'smooth',block:'start'});const box=document.getElementById('inventoryList');box.innerHTML='<div class="inventoryEmpty">Загрузка…</div>';try{const r=await fetch('/api/inventory',{headers:apiHeaders()});const d=await r.json();if(!r.ok){box.innerHTML='<div class="inventoryEmpty">Не удалось загрузить инвентарь.</div>';return}document.getElementById('inventoryCount').textContent=d.items.length+' шт.';if(!d.items.length){box.innerHTML='<div class="inventoryEmpty">Здесь будут храниться ваши выигрыши после колеса удачи.</div>';return}box.innerHTML=d.items.map(i=>{const date=new Date(i.won_at).toLocaleDateString('ru-RU');if(i.status==='activated'){return `<div class="inventoryItem"><div class="inventoryIcon">${i.emoji}</div><div class="inventoryMain"><b>${esc(i.title)}</b><small>Выигрыш от ${date}</small><div class="inventoryCode">Код: ${esc(i.activation_code)}</div></div><span class="inventoryUsed">АКТИВИРОВАН</span></div>`}return `<div class="inventoryItem"><div class="inventoryIcon">${i.emoji}</div><div class="inventoryMain"><b>${esc(i.title)}</b><small>Выигрыш от ${date}</small></div><button class="inventoryAction" onclick="activatePrize(${i.id})">Активировать</button></div>`}).join('')}catch(e){box.innerHTML='<div class="inventoryEmpty">Ошибка загрузки инвентаря.</div>'}}
 async function activatePrize(id){try{const r=await fetch('/api/inventory/'+id+'/activate',{method:'POST',headers:apiHeaders(),body:'{}'});const d=await r.json();if(!r.ok){showToast(d.message||'Не удалось активировать приз');return}await showInventory();showToast('🎁 Приз активирован. Код показан в инвентаре.')}catch(e){showToast('Ошибка активации')}}
 function closeWin(){document.getElementById('winModal').style.display='none'}
