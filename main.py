@@ -5,9 +5,10 @@ import hashlib
 from datetime import datetime, timezone
 from html import escape
 from typing import List
-import random
 from urllib.parse import parse_qsl
 import json
+import random
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, Request
@@ -68,6 +69,21 @@ SERVICES = [
     },
 ]
 
+APP_TZ = ZoneInfo("Europe/Moscow")
+WHEEL_SPIN_COST = 5
+STAR_PACKS = [
+    {"stars": 25, "label": "25 ⭐", "title": "25 звёзд", "description": "Баланс для 5 платных вращений колеса."},
+    {"stars": 50, "label": "50 ⭐", "title": "50 звёзд", "description": "Баланс для 10 платных вращений колеса."},
+    {"stars": 100, "label": "100 ⭐", "title": "100 звёзд", "description": "Баланс для 20 платных вращений колеса."},
+]
+WHEEL_PRIZES = [
+    {"key": "empty", "label": "Пусто", "title": "Попробуй завтра", "weight": 95},
+    {"key": "discount10", "label": "−10%", "title": "Скидка 10%", "weight": 2},
+    {"key": "discount20", "label": "−20%", "title": "Скидка 20%", "weight": 1},
+    {"key": "bonus", "label": "Бонус", "title": "Бонус к размещению", "weight": 1},
+    {"key": "free", "label": "FREE", "title": "Бесплатное размещение", "weight": 1},
+]
+
 class Order(BaseModel):
     service_ids: List[int]
     contact: str = ""
@@ -77,13 +93,15 @@ class Order(BaseModel):
 def db():
     con = sqlite3.connect(DB_PATH)
     con.execute("CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, service_ids TEXT, total INTEGER, contact TEXT, comment TEXT, status TEXT DEFAULT 'new')")
-    con.execute("CREATE TABLE IF NOT EXISTS wheel_spins (telegram_id TEXT PRIMARY KEY, spin_date TEXT NOT NULL, prize_id INTEGER NOT NULL, prize_title TEXT NOT NULL)")
     cols = {row[1] for row in con.execute("PRAGMA table_info(orders)").fetchall()}
     if "status" not in cols:
         con.execute("ALTER TABLE orders ADD COLUMN status TEXT DEFAULT 'new'")
     con.execute("UPDATE orders SET status='new' WHERE status IS NULL OR status=''")
     con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     con.execute("CREATE TABLE IF NOT EXISTS users (telegram_id TEXT PRIMARY KEY, first_name TEXT DEFAULT '', last_name TEXT DEFAULT '', username TEXT DEFAULT '', started_at TEXT NOT NULL, last_seen TEXT NOT NULL)")
+    con.execute("CREATE TABLE IF NOT EXISTS star_wallets (telegram_id TEXT PRIMARY KEY, balance INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)")
+    con.execute("CREATE TABLE IF NOT EXISTS star_payments (telegram_payment_charge_id TEXT PRIMARY KEY, telegram_id TEXT NOT NULL, stars INTEGER NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL)")
+    con.execute("CREATE TABLE IF NOT EXISTS wheel_spins (telegram_id TEXT PRIMARY KEY, last_free_date TEXT, total_spins INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)")
     con.commit()
     return con
 
@@ -138,6 +156,31 @@ def save_started_user(user: dict):
     con.commit()
     con.close()
 
+
+
+def current_user(request: Request):
+    user = validate_telegram_init_data(request.headers.get("X-Telegram-Init-Data", ""))
+    if user:
+        save_started_user(user)
+    return user
+
+def wheel_status_for(telegram_id: str):
+    today = datetime.now(APP_TZ).date().isoformat()
+    con = db()
+    row = con.execute("SELECT balance FROM star_wallets WHERE telegram_id=?", (str(telegram_id),)).fetchone()
+    spin = con.execute("SELECT last_free_date,total_spins FROM wheel_spins WHERE telegram_id=?", (str(telegram_id),)).fetchone()
+    con.close()
+    return {"balance": int(row[0]) if row else 0, "free_available": not spin or spin[0] != today, "total_spins": int(spin[1]) if spin else 0}
+
+def weighted_wheel_prize():
+    total = sum(int(x["weight"]) for x in WHEEL_PRIZES)
+    point = random.uniform(0, total)
+    cursor = 0
+    for prize in WHEEL_PRIZES:
+        cursor += int(prize["weight"])
+        if point < cursor:
+            return prize
+    return WHEEL_PRIZES[0]
 
 async def setup_webhook():
     if not BOT_TOKEN or not PUBLIC_URL:
@@ -247,7 +290,7 @@ async def admin_panel(chat_id: str):
         "SELECT COALESCE(SUM(total), 0) FROM orders"
     ).fetchone()[0]
 
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = datetime.now(APP_TZ).date().isoformat()
 
     today_orders = con.execute(
         "SELECT COUNT(*) FROM orders WHERE created_at LIKE ?",
@@ -289,6 +332,30 @@ async def telegram_webhook(request: Request):
     chat = msg.get("chat") or {}
     text = (msg.get("text") or "").strip()
     chat_id = chat.get("id")
+    pre = update.get("pre_checkout_query") or {}
+    if pre.get("id"):
+        await telegram("answerPreCheckoutQuery", {"pre_checkout_query_id": pre["id"], "ok": True})
+        return {"ok": True}
+    successful = msg.get("successful_payment") or {}
+    if successful.get("currency") == "XTR":
+        payload = str(successful.get("invoice_payload") or "")
+        charge_id = str(successful.get("telegram_payment_charge_id") or "")
+        paid_user_id = str((msg.get("from") or {}).get("id") or chat_id or "")
+        if payload.startswith("stars_pack:") and charge_id and paid_user_id:
+            try: stars = int(payload.split(":")[1])
+            except Exception: stars = 0
+            if stars in [x["stars"] for x in STAR_PACKS]:
+                con = db()
+                exists = con.execute("SELECT 1 FROM star_payments WHERE telegram_payment_charge_id=?", (charge_id,)).fetchone()
+                if not exists:
+                    now = datetime.now(timezone.utc).isoformat()
+                    con.execute("INSERT INTO star_payments(telegram_payment_charge_id,telegram_id,stars,payload,created_at) VALUES(?,?,?,?,?)", (charge_id, paid_user_id, stars, payload, now))
+                    con.execute("INSERT INTO star_wallets(telegram_id,balance,updated_at) VALUES(?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET balance=balance+excluded.balance,updated_at=excluded.updated_at", (paid_user_id, stars, now))
+                    con.commit()
+                row = con.execute("SELECT balance FROM star_wallets WHERE telegram_id=?", (paid_user_id,)).fetchone()
+                con.close()
+                await telegram("sendMessage", {"chat_id": paid_user_id, "text": f"⭐ Баланс пополнен на {stars} Stars.\nТекущий баланс: {int(row[0]) if row else 0} ⭐"})
+        return {"ok": True}
     if chat_id and text.startswith("/setadmin") and ADMIN_SETUP_CODE:
         parts = text.split(maxsplit=1)
         if len(parts) == 2 and parts[1].strip() == ADMIN_SETUP_CODE:
@@ -301,6 +368,8 @@ async def telegram_webhook(request: Request):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "👋 Добро пожаловать! Нажмите «🛍 Услуги» в меню, чтобы открыть каталог."})
     elif chat_id and text.startswith("/help"):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "🏙 <b>ПРАЙС — размещение вакансий в Санкт-Петербурге</b>\n\n🛍 <b>Услуги</b> — открыть каталог и выбрать тариф.\n📋 Выберите услуги, добавьте их в корзину и отправьте заявку.\n⚡ Быстрая публикация • 📣 продвижение вакансии • 🤖 AI-оформление\n\nЕсли нужна помощь, напишите администратору.", "parse_mode": "HTML"})
+    elif chat_id and text.startswith("/paysupport"):
+        await telegram("sendMessage", {"chat_id": chat_id, "text": "💳 По вопросам оплаты Stars и возврата средств напишите администратору: @RZTFrong"})
     elif chat_id and text.startswith("/admin"):
         await admin_panel(str(chat_id))
     elif chat_id and text.startswith("/orders"):
@@ -362,51 +431,57 @@ def is_telegram_admin(request: Request):
     return bool(user and admin_id and str(user.get("id")) == admin_id)
 
 
-WHEEL_PRIZES = [
-    {"id": 1, "title": "Скидка 10%", "subtitle": "На следующее размещение", "code": "LUCK10", "weight": 1},
-    {"id": 2, "title": "Скидка 20%", "subtitle": "На тариф «Под ключ»", "code": "LUCK20", "weight": 0.5},
-    {"id": 3, "title": "+1 публикация", "subtitle": "Бонус к следующему заказу", "code": "LUCKPOST", "weight": 0.7},
-    {"id": 4, "title": "Бесплатная публикация", "subtitle": "Для одной вакансии", "code": "LUCKFREE", "weight": 0.2},
-    {"id": 5, "title": "VIP на 24 часа", "subtitle": "Особый статус в сервисе", "code": "LUCKVIP", "weight": 0.2},
-    {"id": 6, "title": "Скидка 15%", "subtitle": "На пакет START", "code": "LUCK15", "weight": 0.7},
-    {"id": 7, "title": "Бонус 100 ₽", "subtitle": "Скидка на следующий заказ", "code": "LUCK100", "weight": 0.3},
-    {"id": 8, "title": "Попробуйте завтра", "subtitle": "Попробуйте снова завтра", "code": "TRYTOMORROW", "weight": 96.4},
-]
-def wheel_user(request: Request):
-    return validate_telegram_init_data(request.headers.get("X-Telegram-Init-Data", ""))
-
-@app.get("/api/wheel")
+@app.get("/api/wheel/status")
 async def wheel_status(request: Request):
-    user = wheel_user(request)
+    user = current_user(request)
     if not user:
-        return JSONResponse({"ok": False, "message": "Откройте колесо внутри Telegram."}, status_code=403)
-    today = datetime.now(timezone.utc).date().isoformat()
-    con = db()
-    row = con.execute("SELECT prize_id,prize_title,spin_date FROM wheel_spins WHERE telegram_id=?", (str(user["id"]),)).fetchone()
-    con.close()
-    if row and row[2] == today:
-        prize = next((p for p in WHEEL_PRIZES if p["id"] == row[0]), None)
-        return {"ok": True, "available": False, "today": True, "prize": prize or {"id": row[0], "title": row[1], "subtitle": "", "code": ""}}
-    return {"ok": True, "available": True, "today": False}
+        return JSONResponse({"ok": False, "message": "Откройте приложение внутри Telegram."}, status_code=401)
+    return {"ok": True, **wheel_status_for(str(user["id"])), "spin_cost": WHEEL_SPIN_COST, "packs": STAR_PACKS}
 
 @app.post("/api/wheel/spin")
 async def wheel_spin(request: Request):
-    user = wheel_user(request)
+    user = current_user(request)
     if not user:
-        return JSONResponse({"ok": False, "message": "Откройте колесо внутри Telegram."}, status_code=403)
-    today = datetime.now(timezone.utc).date().isoformat()
+        return JSONResponse({"ok": False, "message": "Откройте приложение внутри Telegram."}, status_code=401)
+    telegram_id = str(user["id"])
+    today = datetime.now(APP_TZ).date().isoformat()
     con = db()
-    existing = con.execute("SELECT prize_id,prize_title,spin_date FROM wheel_spins WHERE telegram_id=?", (str(user["id"]),)).fetchone()
-    if existing and existing[2] == today:
-        con.close()
-        prize = next((p for p in WHEEL_PRIZES if p["id"] == existing[0]), None)
-        return {"ok": True, "available": False, "prize": prize or {"id": existing[0], "title": existing[1]}}
-    prize = random.choices(WHEEL_PRIZES, weights=[p["weight"] for p in WHEEL_PRIZES], k=1)[0]
-    con.execute("INSERT OR REPLACE INTO wheel_spins(telegram_id,spin_date,prize_id,prize_title) VALUES(?,?,?,?)",
-                (str(user["id"]), today, prize["id"], prize["title"]))
-    con.commit()
-    con.close()
-    return {"ok": True, "available": False, "prize": prize}
+    row = con.execute("SELECT balance FROM star_wallets WHERE telegram_id=?", (telegram_id,)).fetchone()
+    balance = int(row[0]) if row else 0
+    spin = con.execute("SELECT last_free_date,total_spins FROM wheel_spins WHERE telegram_id=?", (telegram_id,)).fetchone()
+    last_free = spin[0] if spin else None
+    total_spins = int(spin[1]) if spin else 0
+    paid = False
+    now = datetime.now(timezone.utc).isoformat()
+    if last_free != today:
+        con.execute("INSERT INTO wheel_spins(telegram_id,last_free_date,total_spins,updated_at) VALUES(?,?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET last_free_date=excluded.last_free_date,total_spins=excluded.total_spins,updated_at=excluded.updated_at", (telegram_id, today, total_spins + 1, now))
+    else:
+        if balance < WHEEL_SPIN_COST:
+            con.close()
+            return JSONResponse({"ok": False, "need_stars": True, "message": "Бесплатная попытка уже использована. Нужно 5 ⭐."}, status_code=402)
+        balance -= WHEEL_SPIN_COST
+        paid = True
+        con.execute("UPDATE star_wallets SET balance=?,updated_at=? WHERE telegram_id=?", (balance, now, telegram_id))
+        con.execute("INSERT INTO wheel_spins(telegram_id,last_free_date,total_spins,updated_at) VALUES(?,?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET total_spins=excluded.total_spins,updated_at=excluded.updated_at", (telegram_id, last_free, total_spins + 1, now))
+    con.commit(); con.close()
+    prize = weighted_wheel_prize()
+    return {"ok": True, "prize": {"key": prize["key"], "label": prize["label"], "title": prize["title"]}, "paid": paid, "charged": WHEEL_SPIN_COST if paid else 0, "balance": balance, "free_available": False}
+
+@app.post("/api/stars/invoice")
+async def stars_invoice(request: Request):
+    user = current_user(request)
+    if not user:
+        return JSONResponse({"ok": False, "message": "Откройте приложение внутри Telegram."}, status_code=401)
+    body = await request.json()
+    try: stars = int(body.get("stars", 0))
+    except Exception: stars = 0
+    pack = next((x for x in STAR_PACKS if x["stars"] == stars), None)
+    if not pack:
+        return JSONResponse({"ok": False, "message": "Такого пакета нет."}, status_code=400)
+    result = await telegram("createInvoiceLink", {"title": pack["title"], "description": pack["description"], "payload": f"stars_pack:{stars}:user:{user['id']}", "provider_token": "", "currency": "XTR", "prices": [{"label": pack["title"], "amount": stars}]})
+    if not result or not result.get("ok"):
+        return JSONResponse({"ok": False, "message": "Не удалось создать оплату Stars. Проверьте настройки бота."}, status_code=502)
+    return {"ok": True, "invoice_url": result["result"], "stars": stars}
 
 @app.get("/api/admin/me")
 async def admin_me(request: Request):
@@ -456,7 +531,7 @@ def admin_stats():
     con=db()
     total_orders=con.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
     total_revenue=con.execute("SELECT COALESCE(SUM(total),0) FROM orders").fetchone()[0]
-    today=datetime.now(timezone.utc).date().isoformat()
+    today=datetime.now(APP_TZ).date().isoformat()
     today_orders=con.execute("SELECT COUNT(*) FROM orders WHERE created_at LIKE ?",(today+"%",)).fetchone()[0]
     today_revenue=con.execute("SELECT COALESCE(SUM(total),0) FROM orders WHERE created_at LIKE ?",(today+"%",)).fetchone()[0]
     new_orders=con.execute("SELECT COUNT(*) FROM orders WHERE status='new'").fetchone()[0]
@@ -535,12 +610,11 @@ button,input,textarea,select{font:inherit}button{cursor:pointer}.app{max-width:6
 .sectionTitle{display:flex;justify-content:space-between;align-items:end;margin:24px 2px 12px}.sectionTitle h2{margin:0;font-size:22px}.sectionTitle span{color:#8393a7;font-size:11px}.tabs{display:flex;gap:7px;margin-bottom:12px}.tabBtn{border:1px solid var(--line);background:#071827;color:#95a6b8;border-radius:999px;padding:8px 13px;font-size:11px;font-weight:800}.tabBtn.active{background:linear-gradient(90deg,#ffd76a,#8b5cff);color:#071321;border-color:transparent;box-shadow:0 0 18px #8b5cff22}
 .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}.card{position:relative;border:1px solid #214058;border-radius:18px;background:linear-gradient(180deg,#0b1d2e,#06101a);padding:14px 11px;box-shadow:0 14px 34px #00000038, inset 0 0 28px #42e8ff05}.card.hot{border-color:#ffd76a;box-shadow:0 14px 34px #00000038,0 0 24px #ffd76a18,inset 0 0 28px #ffd76a07}.card h3{font-size:14px;margin:0 0 4px}.price{font-size:21px;color:var(--gold2);font-weight:950;margin:5px 0 10px}.card ul{list-style:none;padding:0;margin:0 0 13px;color:#aab6c5;font-size:9px;line-height:1.65}.card li:before{content:"◉";color:var(--gold);font-size:6px;margin-right:5px;vertical-align:middle}.miniBtn{width:100%;border:0;border-radius:11px;padding:10px;background:linear-gradient(135deg,#fff0a8,#ffd76a,#8b5cff);color:#071321;font-size:10px;font-weight:950;box-shadow:0 0 18px #ffd76a18}.tag{position:absolute;right:9px;top:9px;background:linear-gradient(90deg,#ffd76a,#fff0a8);color:#071321;padding:4px 7px;border-radius:7px;font-size:8px;font-weight:950;box-shadow:0 0 16px #ffd76a55}
 .channelCard{position:relative;display:flex;align-items:center;gap:14px;margin-top:15px;overflow:hidden;border:1px solid #6b39ff;border-radius:21px;padding:17px;background:radial-gradient(circle at 85% 15%,#ff2fb34a,transparent 28%),radial-gradient(circle at 20% 100%,#1f8dff38,transparent 34%),linear-gradient(120deg,#081a31,#17113a 55%,#230d35);box-shadow:0 14px 38px #00000044,0 0 28px #8b5cff1e,inset 0 0 35px #42e8ff08}.channelGlow{position:absolute;inset:-60px auto auto 35%;width:220px;height:160px;background:radial-gradient(circle,#8b5cff28,transparent 65%);pointer-events:none}.channelIcon{position:relative;z-index:1;width:68px;height:68px;flex:0 0 68px;border-radius:50%;display:grid;place-items:center;font-size:33px;color:#fff;background:linear-gradient(135deg,#29d9ff,#376cff 52%,#8b5cff);border:1px solid #74edff;box-shadow:0 0 28px #42e8ff66,0 0 45px #8b5cff35}.channelBody{position:relative;z-index:1;min-width:0;flex:1}.channelBadge{display:inline-flex;padding:5px 8px;border-radius:999px;border:1px solid #42e8ff66;background:#42e8ff10;color:#55eaff;font-size:8px;font-weight:900}.channelBody h3{margin:7px 0 4px;font-size:17px}.channelBody p{margin:0 0 11px;color:#c1cada;font-size:10px;line-height:1.45}.channelBtn{width:100%;border:1px solid #a95cff;background:linear-gradient(90deg,#7b32ff,#c52dff);color:#fff;border-radius:12px;padding:10px 12px;font-size:10px;font-weight:950;box-shadow:0 0 22px #8b5cff30}.channelBtn b{float:right;font-size:15px;line-height:10px}.cta{margin-top:15px;border:1px solid #29445b;border-radius:19px;padding:18px;background:linear-gradient(100deg,#0b2033aa,#071321dd),url("https://images.unsplash.com/photo-1513326738677-b964603b136d?auto=format&fit=crop&w=900&q=80") center/cover}.cta h3{margin:0 0 7px}.cta p{font-size:11px;color:#b7c3d1;margin:0 0 12px}
-.list{display:grid;gap:9px}.rowCard{display:flex;align-items:center;justify-content:space-between;gap:10px;border:1px solid var(--line);background:#071827;border-radius:16px;padding:13px}.rowCard .left{min-width:0}.rowCard b{display:block}.rowCard small{color:#8fa0b3;font-size:10px}.qty{display:flex;align-items:center;gap:7px}.qty button{width:27px;height:27px;border-radius:9px;border:1px solid #304960;background:#0b2135;color:#fff}
+.wheelPromo{display:flex;align-items:center;gap:12px;margin-top:15px;padding:13px 14px;border:1px solid #5d4b2b;border-radius:17px;background:linear-gradient(110deg,#17141a,#11182a);box-shadow:0 10px 25px #0006;cursor:pointer}.wheelPromoIcon{width:44px;height:44px;border-radius:13px;display:grid;place-items:center;background:linear-gradient(135deg,#ffd86a,#9c6a24);font-size:24px}.wheelPromo div:nth-child(2){flex:1}.wheelPromo b{display:block;font-size:13px}.wheelPromo small{display:block;color:#8998aa;font-size:10px;margin-top:3px}.wheelPromo>span{color:#ffd76a;font-size:22px}.wheelHead{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}.wheelHead h2{margin:0;font-size:23px;letter-spacing:.5px}.wheelHead span{display:block;color:#8291a2;font-size:10px;margin-top:4px}.starBalance{padding:9px 12px;border-radius:999px;border:1px solid #5e4a24;background:#15130f;color:#ffe29a;font-weight:950;white-space:nowrap}.wheelCard{border:1px solid #72572c;border-radius:24px;background:radial-gradient(circle at 50% 42%,#3b2947 0,#171526 28%,#090e18 62%);padding:18px 14px 20px;text-align:center;box-shadow:0 18px 45px #0008,inset 0 0 40px #d3a44710}.wheelTitle{font-size:19px;font-weight:950;color:#f4d889;margin-bottom:8px}.wheelWrap{position:relative;width:min(330px,88vw);aspect-ratio:1;margin:0 auto 18px;display:grid;place-items:center}.wheel{width:100%;height:100%;border-radius:50%;padding:12px;box-sizing:border-box;background:conic-gradient(#251d37 0 30deg,#37284a 30deg 60deg,#221b34 60deg 90deg,#402c4d 90deg 120deg,#211a33 120deg 150deg,#3b2847 150deg 180deg,#241b37 180deg 210deg,#3f2b4d 210deg 240deg,#211a33 240deg 270deg,#38264a 270deg 300deg,#231a36 300deg 330deg,#3d294c 330deg 360deg);border:11px solid #c89a45;box-shadow:0 0 0 4px #6d4d22,0 0 28px #d8a83c2e,inset 0 0 0 3px #f8d77855;position:relative;transition:transform 4.8s cubic-bezier(.12,.75,.15,1)}.wheel:after{content:"";position:absolute;inset:10px;border-radius:50%;border:2px solid #f2d27a55}.wheelLabel{position:absolute;z-index:1;left:50%;top:50%;width:74px;margin-left:-37px;margin-top:-8px;text-align:center;color:#e9dfd2;font-size:9px;font-weight:950;letter-spacing:.2px;text-shadow:0 1px 2px #000;transform-origin:37px 8px}.l1{transform:rotate(0deg) translateY(-112px)}.l2{transform:rotate(30deg) translateY(-112px)}.l3{transform:rotate(60deg) translateY(-112px)}.l4{transform:rotate(90deg) translateY(-112px)}.l5{transform:rotate(120deg) translateY(-112px)}.l6{transform:rotate(150deg) translateY(-112px)}.l7{transform:rotate(180deg) translateY(-112px)}.l8{transform:rotate(210deg) translateY(-112px)}.l9{transform:rotate(240deg) translateY(-112px)}.l10{transform:rotate(270deg) translateY(-112px)}.l11{transform:rotate(300deg) translateY(-112px)}.l12{transform:rotate(330deg) translateY(-112px)}.wheelInner{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:92px;height:92px;border-radius:50%;display:grid;place-items:center;align-content:center;background:radial-gradient(circle at 35% 30%,#f7d97e,#8e6225 68%,#4b3217);border:7px solid #d0a44f;box-shadow:0 0 0 3px #5c411e,0 0 25px #f0c85c40;z-index:2}.wheelInner b{font-size:24px;color:#24180d;letter-spacing:2px}.wheelInner small{font-size:7px;color:#4e3214;font-weight:950;letter-spacing:2px}.pointer{position:absolute;z-index:4;top:-5px;left:50%;transform:translateX(-50%);width:0;height:0;border-left:17px solid transparent;border-right:17px solid transparent;border-top:34px solid #ffe18a;filter:drop-shadow(0 4px 5px #000)}.spinBtn{width:min(330px,90%);border:1px solid #b88a39;border-radius:14px;padding:14px;background:linear-gradient(180deg,#f3cf70,#a87327);color:#21170d;font-size:13px;font-weight:950;letter-spacing:.4px}.spinBtn:disabled{opacity:.55}.wheelNote{margin-top:10px;color:#9ba7b5;font-size:10px}.starPanel{margin-top:12px;border:1px solid #2b3f53;border-radius:20px;padding:15px;background:#071522}.starPanelTop{display:flex;align-items:center;justify-content:space-between;gap:10px}.starPanelTop b{display:block;font-size:14px}.starPanelTop small{display:block;color:#8190a2;font-size:9px;margin-top:3px}.starPanelTop strong{font-size:19px;color:#ffd86a}.packGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:13px}.packGrid button{border:1px solid #3d4c61;background:#0b1b2b;color:#fff;border-radius:13px;padding:12px 5px}.packGrid b{display:block;color:#ffd86a;font-size:14px}.packGrid small{display:block;color:#8494a7;font-size:9px;margin-top:3px}.wheelRules{margin-top:11px;color:#78889b;font-size:9px;line-height:1.45}.winModal{position:fixed;z-index:90;inset:0;display:none;place-items:center;background:#02050bc9;padding:20px}.winBox{width:min(360px,100%);border:1px solid #a57b35;border-radius:24px;background:linear-gradient(150deg,#151326,#091827);padding:24px;text-align:center;box-shadow:0 25px 70px #000}.winBox .big{font-size:48px}.winBox h3{font-size:22px;margin:8px 0}.winBox p{color:#93a1b2;font-size:11px}.winBox button{width:100%;margin-top:10px}.list{display:grid;gap:9px}.rowCard{display:flex;align-items:center;justify-content:space-between;gap:10px;border:1px solid var(--line);background:#071827;border-radius:16px;padding:13px}.rowCard .left{min-width:0}.rowCard b{display:block}.rowCard small{color:#8fa0b3;font-size:10px}.qty{display:flex;align-items:center;gap:7px}.qty button{width:27px;height:27px;border-radius:9px;border:1px solid #304960;background:#0b2135;color:#fff}
 .sum{margin-top:12px;border:1px solid #28455c;background:#071827;border-radius:19px;padding:17px}.sumline{display:flex;justify-content:space-between;margin:7px 0;color:#aeb9c7}.sumline.total{font-size:20px;color:var(--gold2);font-weight:950;border-top:1px solid var(--line);padding-top:13px;margin-top:12px}
 .form{display:grid;gap:10px}.form input,.form textarea,.form select{width:100%;border:1px solid #29455d;background:#071827;color:#fff;border-radius:13px;padding:13px;outline:none}.form textarea{min-height:90px;resize:vertical}
 .profileHead{display:flex;align-items:center;gap:13px;padding:18px;border:1px solid var(--line);border-radius:19px;background:linear-gradient(120deg,#0c2236,#071522)}.avatar{width:54px;height:54px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(135deg,#caa45c,#ffe7a5);color:#091321;font-size:22px;font-weight:950}.profileName{font-weight:950}.muted{color:#91a0b1;font-size:11px}.profileList{margin-top:10px;border:1px solid var(--line);border-radius:18px;background:#071827;overflow:hidden}.profileItem{display:flex;align-items:center;justify-content:space-between;padding:15px;border-bottom:1px solid var(--line)}.profileItem:last-child{border:0}.profileItem b{font-size:12px}.profileItem small{display:block;color:#7f90a4;margin-top:3px}
-.empty{padding:28px 16px;text-align:center;color:#8293a6;border:1px dashed #2b465d;border-radius:17px}.adminHero{border:1px solid #4b4967;background:linear-gradient(135deg,#101f31,#121027 55%,#071321);border-radius:22px;padding:19px;box-shadow:0 0 30px #8b5cff10,inset 0 0 30px #42e8ff05}.lock{font-size:26px;color:var(--gold)}.adminHero h2{margin:8px 0 4px}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}.stat{border:1px solid var(--line);background:#071827;border-radius:15px;padding:13px}.stat small{color:#7f91a5;font-size:9px}.stat b{display:block;font-size:20px;margin-top:5px;color:var(--gold2)}.adminActions{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px}.adminAction{border:1px solid var(--line);background:#071827;color:#d9e3ee;border-radius:14px;padding:13px 5px;text-align:center;font-size:9px}.adminAction strong{display:block;color:var(--gold);font-size:18px;margin-bottom:4px}.orderAdmin{border:1px solid #203b52;background:#071827;border-radius:16px;padding:13px}.orderTop{display:flex;justify-content:space-between;gap:10px}.orderMeta{color:#8192a5;font-size:9px;margin-top:3px}.status{font-size:9px;font-weight:950;padding:6px 8px;border-radius:999px;white-space:nowrap}.s-new{background:#f5d38a;color:#071321}.s-in_progress{background:#285eaa;color:#dcecff}.s-done{background:#1d744d;color:#dcffed}.s-cancelled{background:#7b3040;color:#ffe3e8}.orderInfo{margin-top:9px;color:#b5c1ce;font-size:10px;line-height:1.55}.orderControls{display:flex;gap:6px;margin-top:10px}.orderControls select{flex:1;border:1px solid #2a455d;background:#0a1d2f;color:#fff;border-radius:10px;padding:8px;font-size:10px}.orderControls button{border:0;border-radius:10px;background:var(--gold);color:#071321;font-weight:950;padding:8px 11px;font-size:10px}.usersPanel{margin-top:14px}.userCard{display:flex;align-items:center;gap:11px;border:1px solid #203b52;background:#071827;border-radius:16px;padding:12px}.userAvatar{width:38px;height:38px;flex:0 0 38px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(135deg,#42e8ff,#8b5cff);color:#fff;font-weight:950}.userMain{min-width:0;flex:1}.userMain b{display:block;font-size:11px}.userMain small{display:block;color:#8192a5;font-size:9px;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.userDate{color:#8f9db0;font-size:9px;text-align:right}.bottom{position:fixed;z-index:50;left:50%;transform:translateX(-50%);bottom:9px;width:min(590px,calc(100% - 18px));padding:7px;border:1px solid #29485f;border-radius:22px;background:rgba(4,10,18,.91);backdrop-filter:blur(22px);box-shadow:0 15px 45px #000b,0 0 28px #42e8ff0d;display:flex;gap:3px}.nav{flex:1;border:0;background:transparent;color:#7f91a6;border-radius:15px;padding:8px 3px 7px;font-size:8px;font-weight:800}.nav .ico{display:block;font-size:17px;margin-bottom:3px}.nav.active{background:linear-gradient(135deg,#102c42,#1b1740);color:#fff0a8;box-shadow:inset 0 0 18px #42e8ff0b}.nav.admin{color:#ffd76a;text-shadow:0 0 10px #ffd76a44}.wheelPromo{margin-top:15px;border:1px solid #29445b;border-radius:20px;padding:15px;background:linear-gradient(135deg,#0a1d2e,#0b1625);display:flex;align-items:center;gap:13px;box-shadow:0 14px 34px #00000030}.wheelPromoIcon{width:52px;height:52px;flex:0 0 52px;border-radius:15px;display:grid;place-items:center;background:#102b43;border:1px solid #3c5f7d;font-size:28px}.wheelPromo h3{margin:0 0 4px;font-size:15px}.wheelPromo p{margin:0;color:#8999ab;font-size:10px;line-height:1.4}.wheelPromo button{margin-left:auto;flex:0 0 auto;border:1px solid #355d7d;background:#102a40;color:#dce9f5;border-radius:11px;padding:10px 12px;font-size:10px;font-weight:900}.wheelHead{border:1px solid #29445b;border-radius:21px;padding:18px;background:linear-gradient(135deg,#0a1c2c,#071321);text-align:center}.wheelHead h2{margin:7px 0 5px;font-size:22px}.wheelHead p{margin:0;color:#8999ab;font-size:11px}.wheelWrap{position:relative;width:min(310px,78vw);aspect-ratio:1;margin:22px auto 18px}.wheelPointer{position:absolute;z-index:3;left:50%;top:-8px;transform:translateX(-50%);width:0;height:0;border-left:13px solid transparent;border-right:13px solid transparent;border-top:24px solid #d8b86a;filter:drop-shadow(0 3px 4px #0008)}.wheel{width:100%;height:100%;border-radius:50%;border:8px solid #1c3348;box-shadow:0 0 0 1px #47637b,0 15px 35px #0008;position:relative;overflow:hidden;transition:transform 4.5s cubic-bezier(.12,.75,.12,1);background:conic-gradient(from -22.5deg,#173b59 0 12.5%,#152d45 12.5% 25%,#245879 25% 37.5%,#19344e 37.5% 50%,#28647e 50% 62.5%,#182f48 62.5% 75%,#214b67 75% 87.5%,#142a40 87.5% 100%)}.wheelLabels{position:absolute;inset:0;pointer-events:none}.wheelLabel{position:absolute;left:50%;top:50%;width:43%;transform-origin:0 50%;text-align:right;color:#dce6ef;font-size:10px;font-weight:900;line-height:1.15;text-shadow:0 1px 3px #000}.wheelCenter{position:absolute;z-index:2;left:50%;top:50%;transform:translate(-50%,-50%);width:70px;height:70px;border-radius:50%;display:grid;place-items:center;background:#0a1724;border:5px solid #d8b86a;color:#e9d79d;font-size:23px;box-shadow:0 0 20px #d8b86a18}.wheelSpinBtn{width:100%;max-width:310px;margin:0 auto;display:block;border:1px solid #3c5e78;border-radius:14px;padding:13px;background:#10283d;color:#f0f4f7;font-weight:900;font-size:13px;box-shadow:0 8px 20px #0005}.wheelSpinBtn:disabled{opacity:.55}.wheelResult{margin-top:14px;border:1px solid #3a536a;border-radius:17px;background:#0a1b2b;padding:15px;text-align:center;display:none}.wheelResult b{display:block;font-size:18px;color:#e7d08d;margin-bottom:4px}.wheelResult small{color:#93a2b1;font-size:10px}.wheelCode{display:inline-block;margin-top:9px;padding:7px 10px;border-radius:9px;background:#102c42;color:#dcecff;font-size:11px;font-weight:900;letter-spacing:.5px}.wheelNote{margin:12px 0 0;color:#718397;font-size:9px;text-align:center}.profileWheel{border-top:1px solid var(--line)}
-.toast{position:fixed;z-index:80;left:50%;transform:translateX(-50%);bottom:90px;width:min(500px,calc(100% - 30px));padding:13px 15px;border-radius:14px;background:#10273a;border:1px solid #31516b;color:#fff;text-align:center;font-size:12px;display:none}
+.empty{padding:28px 16px;text-align:center;color:#8293a6;border:1px dashed #2b465d;border-radius:17px}.adminHero{border:1px solid #4b4967;background:linear-gradient(135deg,#101f31,#121027 55%,#071321);border-radius:22px;padding:19px;box-shadow:0 0 30px #8b5cff10,inset 0 0 30px #42e8ff05}.lock{font-size:26px;color:var(--gold)}.adminHero h2{margin:8px 0 4px}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}.stat{border:1px solid var(--line);background:#071827;border-radius:15px;padding:13px}.stat small{color:#7f91a5;font-size:9px}.stat b{display:block;font-size:20px;margin-top:5px;color:var(--gold2)}.adminActions{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px}.adminAction{border:1px solid var(--line);background:#071827;color:#d9e3ee;border-radius:14px;padding:13px 5px;text-align:center;font-size:9px}.adminAction strong{display:block;color:var(--gold);font-size:18px;margin-bottom:4px}.orderAdmin{border:1px solid #203b52;background:#071827;border-radius:16px;padding:13px}.orderTop{display:flex;justify-content:space-between;gap:10px}.orderMeta{color:#8192a5;font-size:9px;margin-top:3px}.status{font-size:9px;font-weight:950;padding:6px 8px;border-radius:999px;white-space:nowrap}.s-new{background:#f5d38a;color:#071321}.s-in_progress{background:#285eaa;color:#dcecff}.s-done{background:#1d744d;color:#dcffed}.s-cancelled{background:#7b3040;color:#ffe3e8}.orderInfo{margin-top:9px;color:#b5c1ce;font-size:10px;line-height:1.55}.orderControls{display:flex;gap:6px;margin-top:10px}.orderControls select{flex:1;border:1px solid #2a455d;background:#0a1d2f;color:#fff;border-radius:10px;padding:8px;font-size:10px}.orderControls button{border:0;border-radius:10px;background:var(--gold);color:#071321;font-weight:950;padding:8px 11px;font-size:10px}.usersPanel{margin-top:14px}.userCard{display:flex;align-items:center;gap:11px;border:1px solid #203b52;background:#071827;border-radius:16px;padding:12px}.userAvatar{width:38px;height:38px;flex:0 0 38px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(135deg,#42e8ff,#8b5cff);color:#fff;font-weight:950}.userMain{min-width:0;flex:1}.userMain b{display:block;font-size:11px}.userMain small{display:block;color:#8192a5;font-size:9px;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.userDate{color:#8f9db0;font-size:9px;text-align:right}.bottom{position:fixed;z-index:50;left:50%;transform:translateX(-50%);bottom:9px;width:min(590px,calc(100% - 18px));padding:7px;border:1px solid #29485f;border-radius:22px;background:rgba(4,10,18,.91);backdrop-filter:blur(22px);box-shadow:0 15px 45px #000b,0 0 28px #42e8ff0d;display:flex;gap:3px}.nav{flex:1;border:0;background:transparent;color:#7f91a6;border-radius:15px;padding:8px 3px 7px;font-size:8px;font-weight:800}.nav .ico{display:block;font-size:17px;margin-bottom:3px}.nav.active{background:linear-gradient(135deg,#102c42,#1b1740);color:#fff0a8;box-shadow:inset 0 0 18px #42e8ff0b}.nav.admin{color:#ffd76a;text-shadow:0 0 10px #ffd76a44}.toast{position:fixed;z-index:80;left:50%;transform:translateX(-50%);bottom:90px;width:min(500px,calc(100% - 30px));padding:13px 15px;border-radius:14px;background:#10273a;border:1px solid #31516b;color:#fff;text-align:center;font-size:12px;display:none}
 @media(min-width:700px){.app{max-width:1100px}.view{padding:20px}.hero{min-height:520px;padding:40px}.hero h1{font-size:50px}.cards{gap:14px}.card{padding:18px}.bottom{width:min(650px,calc(100% - 30px))}}@media(max-width:380px){.hero h1{font-size:33px}.features{grid-template-columns:repeat(2,1fr)}.cards{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.adminActions{grid-template-columns:repeat(2,1fr)}}
 </style>
 </head>
@@ -548,15 +622,15 @@ button,input,textarea,select{font:inherit}button{cursor:pointer}.app{max-width:6
 <div class="app">
 <header class="topbar"><div class="brand"><div class="brandIcon">♜</div><div>Работа в Питере<small>mini app</small></div></div><div class="topActions"><button class="iconBtn" onclick="showToast('Работаем ежедневно')">✦</button><button class="iconBtn" onclick="go('profile')">⋯</button></div></header>
 
-<section id="home" class="view active"><div class="hero"><div class="badge">Публичные вакансии</div><h1>Найдите лучших<br>сотрудников в <span>Санкт-Петербурге</span></h1><p>Современные инструменты, AI-визуализация, целевой охват и быстрая публикация.</p><div class="actions"><button class="btn gold" onclick="go('tariffs')">Выбрать тариф →</button><button class="btn" onclick="showHow()">Как это работает</button></div></div><div class="features"><div class="feature"><b>◎</b><small>СПб и ЛО<br>Региональный охват</small></div><div class="feature"><b>✧</b><small>AI-визуализация<br>Уникальные креативы</small></div><div class="feature"><b>◉</b><small>Быстрый запуск<br>В течение 15 минут</small></div><div class="feature"><b>♧</b><small>Поддержка<br>24/7</small></div></div><div class="wheelPromo"><div class="wheelPromoIcon">🎡</div><div><h3>Колесо бонусов</h3><p>Одно бесплатное вращение каждый день.</p></div><button onclick="go('wheel')">Испытать удачу →</button></div><div class="sectionTitle"><h2>Наши тарифы</h2><span>Выберите подходящий вариант</span></div><div class="tabs"><button class="tabBtn active">Тарифы</button><button class="tabBtn" onclick="go('packages')">Пакеты</button></div><div id="homeCards" class="cards"></div><div class="channelCard"><div class="channelGlow"></div><div class="channelIcon">✈</div><div class="channelBody"><span class="channelBadge">Официальный канал</span><h3>💼 Работа в Питере | Вакансии</h3><p>Свежие вакансии Санкт-Петербурга, новости и новые предложения каждый день.</p><button class="channelBtn" onclick="openChannel()">Перейти в Telegram-канал <b>→</b></button></div></div><div class="cta"><h3>Готовы найти свою команду?</h3><p>Оставьте заявку — мы подберём лучший формат размещения под вашу задачу.</p><button class="btn gold" onclick="go('tariffs')">Оставить заявку</button></div></section>
+<section id="home" class="view active"><div class="hero"><div class="badge">Публичные вакансии</div><h1>Найдите лучших<br>сотрудников в <span>Санкт-Петербурге</span></h1><p>Современные инструменты, AI-визуализация, целевой охват и быстрая публикация.</p><div class="actions"><button class="btn gold" onclick="go('tariffs')">Выбрать тариф →</button><button class="btn" onclick="showHow()">Как это работает</button></div></div><div class="features"><div class="feature"><b>◎</b><small>СПб и ЛО<br>Региональный охват</small></div><div class="feature"><b>✧</b><small>AI-визуализация<br>Уникальные креативы</small></div><div class="feature"><b>◉</b><small>Быстрый запуск<br>В течение 15 минут</small></div><div class="feature"><b>♧</b><small>Поддержка<br>24/7</small></div></div><div class="sectionTitle"><h2>Наши тарифы</h2><span>Выберите подходящий вариант</span></div><div class="tabs"><button class="tabBtn active">Тарифы</button><button class="tabBtn" onclick="go('packages')">Пакеты</button></div><div id="homeCards" class="cards"></div><div class="wheelPromo" onclick="go('wheel')"><div class="wheelPromoIcon">🎡</div><div><b>Колесо удачи</b><small>1 бесплатная попытка сегодня • потом 5 ⭐</small></div><span>→</span></div><div class="channelCard"><div class="channelGlow"></div><div class="channelIcon">✈</div><div class="channelBody"><span class="channelBadge">Официальный канал</span><h3>💼 Работа в Питере | Вакансии</h3><p>Свежие вакансии Санкт-Петербурга, новости и новые предложения каждый день.</p><button class="channelBtn" onclick="openChannel()">Перейти в Telegram-канал <b>→</b></button></div></div><div class="cta"><h3>Готовы найти свою команду?</h3><p>Оставьте заявку — мы подберём лучший формат размещения под вашу задачу.</p><button class="btn gold" onclick="go('tariffs')">Оставить заявку</button></div></section>
+
+<section id="wheel" class="view"><div class="wheelHead"><div><h2>КОЛЕСО УДАЧИ</h2><span>1 бесплатная попытка каждый день</span></div><div class="starBalance" id="wheelBalance">0 ⭐</div></div><div class="wheelCard"><div class="wheelTitle">Испытай удачу</div><div class="wheelWrap"><div class="pointer">▼</div><div class="wheel" id="wheelDisk"><div class="wheelLabel l1">ПУСТО</div><div class="wheelLabel l2">−10%</div><div class="wheelLabel l3">ПУСТО</div><div class="wheelLabel l4">БОНУС</div><div class="wheelLabel l5">ПУСТО</div><div class="wheelLabel l6">−20%</div><div class="wheelLabel l7">ПУСТО</div><div class="wheelLabel l8">FREE</div><div class="wheelLabel l9">ПУСТО</div><div class="wheelLabel l10">БОНУС</div><div class="wheelLabel l11">ПУСТО</div><div class="wheelLabel l12">ПУСТО</div><div class="wheelInner"><b>SPB</b><small>УДАЧА</small></div></div></div><button class="spinBtn" id="spinBtn" onclick="spinWheel()">КРУТИТЬ КОЛЕСО</button><div class="wheelNote" id="wheelNote">После бесплатной попытки — 5 ⭐ за вращение.</div></div><div class="starPanel"><div class="starPanelTop"><div><b>⭐ Баланс</b><small>Внутренний баланс для платных вращений</small></div><strong id="starBalanceLarge">0 ⭐</strong></div><div class="packGrid"><button onclick="buyStars(25)"><b>25 ⭐</b><small>5 вращений</small></button><button onclick="buyStars(50)"><b>50 ⭐</b><small>10 вращений</small></button><button onclick="buyStars(100)"><b>100 ⭐</b><small>20 вращений</small></button></div><div class="wheelRules">Шансы определяются сервером. Основной результат — «Попробуй завтра». Бесплатная попытка доступна раз в сутки.</div></div></section>
 
 <section id="tariffs" class="view"><div class="sectionTitle"><div><h2>Тарифы</h2><span>Разовое размещение вакансии</span></div></div><div id="tariffCards" class="cards"></div></section>
 <section id="packages" class="view"><div class="sectionTitle"><div><h2>Пакеты</h2><span>Готовые решения для регулярного найма</span></div></div><div id="packageCards" class="list"></div></section>
 <section id="cart" class="view"><div class="sectionTitle"><div><h2>Корзина <span id="cartCount"></span></h2><span onclick="clearCart()" style="cursor:pointer;color:var(--gold)">Очистить</span></div></div><div id="cartList" class="list"></div><div id="cartSummary"></div></section>
 
-<section id="wheel" class="view"><div class="sectionTitle"><div><h2>Колесо бонусов</h2><span>Бесплатное вращение раз в день</span></div></div><div class="wheelHead"><div class="badge">Бонус дня</div><h2>Испытайте удачу</h2><p>Получите промокод или полезный бонус для следующего заказа.</p><div class="wheelWrap"><div class="wheelPointer"></div><div class="wheel" id="wheelGraphic"><div class="wheelLabels"><span class="wheelLabel" style="transform:rotate(0deg) translateX(-50%)">10%<br>скидка</span><span class="wheelLabel" style="transform:rotate(45deg) translateX(-50%)">20%<br>скидка</span><span class="wheelLabel" style="transform:rotate(90deg) translateX(-50%)">+1<br>публикация</span><span class="wheelLabel" style="transform:rotate(135deg) translateX(-50%)">Бесплатно</span><span class="wheelLabel" style="transform:rotate(180deg) translateX(-50%)">VIP<br>24 часа</span><span class="wheelLabel" style="transform:rotate(225deg) translateX(-50%)">15%<br>скидка</span><span class="wheelLabel" style="transform:rotate(270deg) translateX(-50%)">100 ₽<br>бонус</span><span class="wheelLabel" style="transform:rotate(315deg) translateX(-50%)">Завтра</span></div><div class="wheelCenter">✦</div></div></div><button id="wheelSpinBtn" class="wheelSpinBtn" onclick="spinWheel()">Крутить колесо</button><div id="wheelResult" class="wheelResult"></div><div class="wheelNote">Бонусы не являются денежным выигрышем и не обмениваются на деньги.</div></div></section>
-
-<section id="profile" class="view"><div class="sectionTitle"><div><h2>Профиль</h2><span>Ваши заявки и настройки</span></div></div><div class="profileHead"><div class="avatar" id="avatar">Р</div><div><div class="profileName" id="profileName">Работодатель</div><div class="muted">Клиент сервиса «Работа в Питере»</div></div></div><div class="profileList"><div class="profileItem" onclick="showHistory()"><div><b>📋 Мои заказы</b><small>История отправленных заявок</small></div><b>›</b></div><div class="profileItem" onclick="showHow()"><div><b>💡 Как это работает</b><small>От заявки до публикации</small></div><b>›</b></div><div class="profileItem" onclick="openChannel()"><div><b>📢 Наш Telegram-канал</b><small>Вакансии и новости Санкт-Петербурга</small></div><b>›</b></div><div class="profileItem profileWheel" onclick="go('wheel')"><div><b>🎡 Колесо бонусов</b><small>Бесплатное вращение каждый день</small></div><b>›</b></div><div class="profileItem" onclick="openSupport()"><div><b>💬 Поддержка</b><small>Написать администратору в Telegram</small></div><b>›</b></div></div><div id="history"></div><div class="cta"><h3>Нужна помощь?</h3><p>Свяжитесь с нами по любому вопросу по размещению вакансии.</p><button class="btn gold" onclick="openSupport()">Написать администратору →</button></div></section>
+<section id="profile" class="view"><div class="sectionTitle"><div><h2>Профиль</h2><span>Ваши заявки и настройки</span></div></div><div class="profileHead"><div class="avatar" id="avatar">Р</div><div><div class="profileName" id="profileName">Работодатель</div><div class="muted">Клиент сервиса «Работа в Питере»</div></div></div><div class="profileList"><div class="profileItem" onclick="showHistory()"><div><b>📋 Мои заказы</b><small>История отправленных заявок</small></div><b>›</b></div><div class="profileItem" onclick="showHow()"><div><b>💡 Как это работает</b><small>От заявки до публикации</small></div><b>›</b></div><div class="profileItem" onclick="go('wheel')"><div><b>🎡 Колесо удачи</b><small>Бесплатная попытка + вращения за ⭐</small></div><b>›</b></div><div class="profileItem" onclick="openChannel()"><div><b>📢 Наш Telegram-канал</b><small>Вакансии и новости Санкт-Петербурга</small></div><b>›</b></div><div class="profileItem" onclick="openSupport()"><div><b>💬 Поддержка</b><small>Написать администратору в Telegram</small></div><b>›</b></div></div><div id="history"></div><div class="cta"><h3>Нужна помощь?</h3><p>Свяжитесь с нами по любому вопросу по размещению вакансии.</p><button class="btn gold" onclick="openSupport()">Написать администратору →</button></div></section>
 
 <section id="checkout" class="view"><div class="sectionTitle"><div><h2>Оформление заявки</h2><span id="checkoutChosen">Выбранные услуги</span></div></div><div class="form"><input id="contact" placeholder="Ваш Telegram / телефон" autocomplete="off"><textarea id="comment" placeholder="Комментарий (необязательно)"></textarea><button class="btn gold full" onclick="sendOrder()">Отправить заявку →</button></div><div id="result"></div></section>
 
@@ -565,11 +639,16 @@ button,input,textarea,select{font:inherit}button{cursor:pointer}.app{max-width:6
 
 <nav class="bottom"><button class="nav active" data-go="home"><span class="ico">⌂</span>Главная</button><button class="nav" data-go="tariffs"><span class="ico">◎</span>Тарифы</button><button class="nav" data-go="packages"><span class="ico">◇</span>Пакеты</button><button class="nav" data-go="cart"><span class="ico">🛒</span>Корзина <span id="navCount"></span></button><button class="nav" data-go="profile"><span class="ico">♙</span>Профиль</button><button class="nav admin" id="adminNav" data-go="admin" style="display:none"><span class="ico">♛</span>Админка</button></nav>
 <div id="toast" class="toast"></div>
+<div id="winModal" class="winModal"><div class="winBox"><div class="big" id="winEmoji">🎉</div><h3 id="winTitle">Поздравляем!</h3><p id="winText"></p><button class="btn gold full" onclick="closeWin()">Закрыть</button></div></div>
 
 <script>
 const tg=window.Telegram&&window.Telegram.WebApp?window.Telegram.WebApp:null;if(tg){tg.ready();tg.expand();try{tg.setHeaderColor('#070b13');tg.setBackgroundColor('#03060b')}catch(e){}}
 const initData=tg?.initData||'';let services=[],cart=JSON.parse(localStorage.getItem('workspb_cart')||'[]'),orders=JSON.parse(localStorage.getItem('workspb_orders')||'[]'),adminData=null,adminFilter='all';
 const rub=n=>new Intl.NumberFormat('ru-RU').format(n)+' ₽',byId=id=>services.find(s=>s.id===id);function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}function apiHeaders(){return {'X-Telegram-Init-Data':initData,'Content-Type':'application/json'}}function showToast(msg){const x=document.getElementById('toast');x.textContent=msg;x.style.display='block';clearTimeout(window.__toast);window.__toast=setTimeout(()=>x.style.display='none',2600)}
+async function loadWheel(){try{const r=await fetch('/api/wheel/status',{headers:apiHeaders()});const d=await r.json();if(!r.ok){showToast(d.message||'Откройте приложение в Telegram');return}document.getElementById('wheelBalance').textContent=d.balance+' ⭐';document.getElementById('starBalanceLarge').textContent=d.balance+' ⭐';document.getElementById('wheelNote').textContent=d.free_available?'Сегодня доступна бесплатная попытка.':'Бесплатная попытка уже использована • следующее вращение 5 ⭐.'}catch(e){showToast('Не удалось загрузить баланс')}}
+async function buyStars(stars){try{const r=await fetch('/api/stars/invoice',{method:'POST',headers:apiHeaders(),body:JSON.stringify({stars})});const d=await r.json();if(!r.ok){showToast(d.message||'Не удалось создать счёт');return}if(tg&&typeof tg.openInvoice==='function'){tg.openInvoice(d.invoice_url,status=>{if(status==='paid'){showToast('⭐ Оплата прошла');setTimeout(loadWheel,700)}})}else{window.location.href=d.invoice_url}}catch(e){showToast('Ошибка оплаты Stars')}}
+async function spinWheel(){const btn=document.getElementById('spinBtn');if(btn.disabled)return;btn.disabled=true;try{const r=await fetch('/api/wheel/spin',{method:'POST',headers:apiHeaders(),body:'{}'});const d=await r.json();if(r.status===402&&d.need_stars){btn.disabled=false;showToast('Нужно 5 ⭐ за платное вращение');return}if(!r.ok){btn.disabled=false;showToast(d.message||'Не удалось прокрутить колесо');return}const disk=document.getElementById('wheelDisk');const turns=6+Math.floor(Math.random()*3);const stop=Math.floor(Math.random()*360);disk.style.transform=`rotate(${turns*360+stop}deg)`;setTimeout(()=>{document.getElementById('winTitle').textContent=d.prize.title;document.getElementById('winText').textContent=d.paid?'Списано 5 ⭐ с баланса.':'Бесплатная попытка использована.';document.getElementById('winEmoji').textContent=d.prize.key==='empty'?'🙂':d.prize.key==='free'?'🎁':'⭐';document.getElementById('winModal').style.display='grid';btn.disabled=false;loadWheel()},4900)}catch(e){btn.disabled=false;showToast('Ошибка вращения')}}
+function closeWin(){document.getElementById('winModal').style.display='none'}
 function openChannel(){const url='https://t.me/worksaintpeterburg';if(tg&&tg.openTelegramLink){tg.openTelegramLink(url)}else{window.open(url,'_blank')}}function go(id){document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('.nav').forEach(x=>x.classList.toggle('active',x.dataset.go===id));window.scrollTo({top:0,behavior:'smooth'});if(id==='cart')renderCart();if(id==='profile')renderProfile();if(id==='admin')loadAdmin();if(id==='checkout')renderCheckout();if(id==='wheel')loadWheel()}
 function card(s){return `<article class="card ${s.id===2?'hot':''}">${s.id===2?'<span class="tag">Хит</span>':''}<h3>${esc(s.name)}</h3><div class="price">${rub(s.price)}</div><ul>${s.features.slice(0,4).map(f=>`<li>${esc(f)}</li>`).join('')}</ul><button class="miniBtn" onclick="add(${s.id})">Выбрать</button></article>`}
 function packageCard(s){return `<div class="rowCard"><div class="left"><b>${esc(s.name)}</b><small>${esc(s.subtitle)}</small><div class="price" style="font-size:19px;margin:5px 0">${rub(s.price)}</div><small>${s.features.slice(0,4).map(esc).join(' · ')}</small></div><button class="btn gold" onclick="add(${s.id})">Выбрать</button></div>`}
@@ -582,36 +661,6 @@ function renderProfile(){const u=tg?.initDataUnsafe?.user;if(u){document.getElem
 function showHistory(){const h=document.getElementById('history');if(!orders.length){h.innerHTML='<div class="empty">📋 История заявок появится после первой отправки.</div>';return}h.innerHTML='<h3 style="margin:18px 0 9px">Мои заказы</h3><div class="list">'+orders.map(o=>`<div class="rowCard"><div class="left"><b>Заказ #${o.id}</b><small>${esc(o.services?.join(', '))} · ${new Date(o.created_at).toLocaleDateString('ru-RU')}</small></div><b>${rub(o.total)}</b></div>`).join('')+'</div>'}
 function showHow(){showToast('Выберите тариф → заполните контакт → отправьте заявку → менеджер свяжется с вами.')}
 function openSupport(){const url='https://t.me/RZTFrong';try{if(tg&&typeof tg.openTelegramLink==='function'){tg.openTelegramLink(url);return}}catch(e){}window.location.href=url;}
-let wheelSpinning=false,wheelRotation=0;
-const wheelAngles={1:0,2:45,3:90,4:135,5:180,6:225,7:270,8:315};
-async function loadWheel(){
-  const btn=document.getElementById('wheelSpinBtn'),res=document.getElementById('wheelResult');
-  if(!btn)return;
-  res.style.display='none';btn.disabled=false;btn.textContent='Крутить колесо';
-  try{
-    const r=await fetch('/api/wheel',{headers:apiHeaders()});const d=await r.json();
-    if(!r.ok){btn.disabled=true;btn.textContent='Доступно внутри Telegram';return}
-    if(!d.available&&d.prize){btn.disabled=true;btn.textContent='Сегодня уже крутили';showWheelResult(d.prize,true)}
-  }catch(e){btn.disabled=true;btn.textContent='Не удалось загрузить колесо'}
-}
-function showWheelResult(p,old=false){
-  const res=document.getElementById('wheelResult');if(!res)return;
-  res.innerHTML=`<b>${esc(p.title)}</b><small>${esc(p.subtitle||'')}</small>${p.code&&p.code!=='TRYTOMORROW'?`<div class="wheelCode">${esc(p.code)}</div>`:''}${old?'<div style="margin-top:8px;color:#718397;font-size:9px">Этот бонус уже получен сегодня.</div>':''}`;
-  res.style.display='block';
-}
-async function spinWheel(){
-  if(wheelSpinning)return;
-  const btn=document.getElementById('wheelSpinBtn'),wheel=document.getElementById('wheelGraphic');
-  try{
-    btn.disabled=true;btn.textContent='Колесо вращается…';wheelSpinning=true;
-    const r=await fetch('/api/wheel/spin',{method:'POST',headers:apiHeaders()});const d=await r.json();
-    if(!r.ok||!d.ok){showToast(d.message||'Не удалось запустить колесо');btn.disabled=false;wheelSpinning=false;return}
-    const p=d.prize,segment=wheelAngles[p.id]??0;
-    wheelRotation += 1800 + (360-segment);
-    wheel.style.transform=`rotate(${wheelRotation}deg)`;
-    setTimeout(()=>{showWheelResult(p,false);btn.textContent='До завтра';wheelSpinning=false},4600);
-  }catch(e){showToast('Не удалось запустить колесо');btn.disabled=false;wheelSpinning=false}
-}
 async function checkAdmin(){try{const r=await fetch('/api/admin/me',{headers:apiHeaders()});const d=await r.json();if(d.admin){document.getElementById('adminNav').style.display='block';return true}}catch(e){}return false}
 async function loadAdmin(){if(!initData){showToast('Админка доступна только внутри Telegram');return}try{const r=await fetch('/api/admin/dashboard',{headers:apiHeaders()});if(!r.ok){showToast('Нет доступа');return}const d=await r.json();adminData=d.data;document.getElementById('aToday').textContent=adminData.today_orders;document.getElementById('aTotal').textContent=adminData.total_orders;document.getElementById('aRevenue').textContent=rub(adminData.total_revenue);document.getElementById('aNew').textContent=adminData.new_orders;document.getElementById('aWork').textContent=adminData.in_progress;document.getElementById('aDone').textContent=adminData.done;document.getElementById('aUsers').textContent=adminData.user_count||0;renderAdminOrders()}catch(e){showToast('Не удалось загрузить админку')}}
 async function showUsers(){
