@@ -153,6 +153,57 @@ async def checkout(order: Order):
     return {"ok": True, "order_id": order_id, "total": total, "notified": bool(BOT_TOKEN and admin), "message": "Заявка отправлена! Мы свяжемся с вами для подтверждения."}
 
 
+
+async def orders_history(chat_id: str):
+    if str(chat_id) != str(get_admin_chat_id()):
+        return
+
+    con = db()
+    rows = con.execute(
+        "SELECT id, created_at, service_ids, total, contact, comment "
+        "FROM orders ORDER BY id DESC LIMIT 10"
+    ).fetchall()
+    con.close()
+
+    if not rows:
+        await telegram(
+            "sendMessage",
+            {"chat_id": chat_id, "text": "📋 История заказов пока пуста."}
+        )
+        return
+
+    lines = ["📋 <b>ПОСЛЕДНИЕ 10 ЗАКАЗОВ</b>", ""]
+    for order_id, created_at, service_ids, total, contact, comment in rows:
+        names = []
+        for raw_id in (service_ids or "").split(","):
+            try:
+                sid = int(raw_id.strip())
+            except ValueError:
+                continue
+            service = next((s for s in SERVICES if s["id"] == sid), None)
+            if service:
+                names.append(service["name"])
+
+        service_text = ", ".join(names) if names else "Услуга не найдена"
+        lines.append(
+            f"🧾 <b>Заказ #{order_id}</b>\n"
+            f"🕐 {escape(str(created_at))}\n"
+            f"🛍 {escape(service_text)}\n"
+            f"💰 <b>{total} ₽</b>\n"
+            f"📞 {escape(contact or '—')}\n"
+            f"💬 {escape(comment or '—')}"
+        )
+        lines.append("")
+
+    await telegram(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": "\n".join(lines),
+            "parse_mode": "HTML",
+        },
+    )
+
 async def admin_panel(chat_id: str):
     if str(chat_id) != str(get_admin_chat_id()):
         return
@@ -222,6 +273,8 @@ async def telegram_webhook(request: Request):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "🏙 <b>ПРАЙС — размещение вакансий в Санкт-Петербурге</b>\n\n🛍 <b>Услуги</b> — открыть каталог и выбрать тариф.\n📋 Выберите услуги, добавьте их в корзину и отправьте заявку.\n⚡ Быстрая публикация • 📣 продвижение вакансии • 🤖 AI-оформление\n\nЕсли нужна помощь, напишите администратору.", "parse_mode": "HTML"})
     elif chat_id and text.startswith("/admin"):
         await admin_panel(str(chat_id))
+    elif chat_id and text.startswith("/orders"):
+        await orders_history(str(chat_id))
     return {"ok": True}
 
 
