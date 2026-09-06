@@ -347,7 +347,7 @@ async def run_broadcast(admin_chat_id: str, broadcast_text: str, photo_id: str |
         con.close()
         sent = 0
         failed = 0
-        keyboard = {"inline_keyboard": [[{"text": "🎡 Открыть колесо", "web_app": {"url": PUBLIC_URL}}]]}
+        keyboard = {"inline_keyboard": [[{"text": "🎡 Открыть колесо", "web_app": {"url": PUBLIC_URL + "?open=wheel"}}]]}
         for uid in users:
             if photo_id:
                 payload = {"chat_id": uid, "photo": photo_id, "caption": escape(broadcast_text)[:1024], "reply_markup": keyboard}
@@ -795,7 +795,7 @@ async function showUsers(){
 
 function filterAdmin(f){adminFilter=f;renderAdminOrders()}function renderAdminOrders(){const box=document.getElementById('adminOrders');if(!adminData){box.innerHTML='<div class="empty">Загрузка…</div>';return}let rows=adminData.orders;if(adminFilter!=='all')rows=rows.filter(o=>o.status===adminFilter);if(!rows.length){box.innerHTML='<div class="empty">Заказов в этом разделе нет.</div>';return}box.innerHTML=rows.map(o=>{const status=o.status||'new';return `<div class="orderAdmin"><div class="orderTop"><div><b>#${o.id} · ${rub(o.total)}</b><div class="orderMeta">${new Date(o.created_at).toLocaleString('ru-RU')}</div></div><span class="status s-${status}">${({'new':'Новая','in_progress':'В работе','done':'Выполнено','cancelled':'Отменена'})[status]}</span></div><div class="orderInfo"><b>${esc(o.services.join(', '))}</b><br>👤 ${esc(o.contact)}${o.comment&&o.comment!=='—'?'<br>💬 '+esc(o.comment):''}</div><div class="orderControls"><select id="st-${o.id}"><option value="new" ${status==='new'?'selected':''}>Новая</option><option value="in_progress" ${status==='in_progress'?'selected':''}>В работе</option><option value="done" ${status==='done'?'selected':''}>Выполнено</option><option value="cancelled" ${status==='cancelled'?'selected':''}>Отменена</option></select><button onclick="saveStatus(${o.id})">Сохранить</button></div></div>`}).join('')}
 async function saveStatus(id){const status=document.getElementById('st-'+id).value;const r=await fetch('/api/admin/orders/'+id+'/status',{method:'POST',headers:apiHeaders(),body:JSON.stringify({status})});if(!r.ok){showToast('Не удалось изменить статус');return}showToast('Статус заказа обновлён');await loadAdmin()}
-function render(){renderTariffs();renderPackages();renderCart();renderProfile()}document.querySelectorAll('.nav').forEach(b=>b.addEventListener('click',()=>go(b.dataset.go)));(async()=>{try{services=await (await fetch('/api/services')).json();render();await checkAdmin()}catch(e){showToast('Не удалось загрузить каталог')}})();
+function render(){renderTariffs();renderPackages();renderCart();renderProfile()}document.querySelectorAll('.nav').forEach(b=>b.addEventListener('click',()=>go(b.dataset.go)));(async()=>{try{services=await (await fetch('/api/services')).json();render();await checkAdmin();if(new URLSearchParams(location.search).get('open')==='wheel'){setTimeout(()=>go('wheel'),80)}}catch(e){showToast('Не удалось загрузить каталог')}})();
 </script>
 </body></html>
 '''
