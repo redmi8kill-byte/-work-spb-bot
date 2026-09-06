@@ -1,39 +1,27 @@
 # Работа в Питере — Telegram Mini App
 
-Финальная версия Mini App в тёмном neon/glass стиле для Telegram.
+Готовый FastAPI-проект для Telegram Mini App сервиса размещения вакансий в Санкт-Петербурге.
 
 ## Что внутри
-- Главная, Тарифы, Пакеты, Корзина, Профиль
-- Оформление заявки с дополнительными услугами
-- История заказов
-- Админка внутри Mini App, доступная только привязанному администратору
-- Статистика, список заказов и изменение статуса заказа
-- Раздел «Пользователи»: автоматически сохраняет тех, кто запустил бота через `/start`
-- В списке пользователей: имя, `@username`, Telegram ID и дата первого запуска
-- Telegram-команды `/admin`, `/orders`, `/setadmin`
-- Уведомления о новых заявках в Telegram
-- Кнопка поддержки открывает `@RZTFrong`
-- SQLite для хранения заказов и настроек
-- Проверка Telegram WebApp initData для админ-доступа
-- Дополнительная web-админка `/admin-web`
+- тёмный neon/glass дизайн Mini App;
+- тарифы и пакеты;
+- корзина и оформление заявки;
+- профиль и поддержка;
+- официальный Telegram-канал: https://t.me/worksaintpeterburg;
+- скрытая админка внутри Mini App только для Telegram-администратора;
+- статистика, заказы и пользователи;
+- Telegram webhook и уведомления админу;
+- SQLite.
 
-## Railway
+## Запуск
+```bash
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port $PORT
+```
 
-Start Command:
-`uvicorn main:app --host 0.0.0.0 --port $PORT`
+Для Railway нужны переменные:
+- `BOT_TOKEN`
+- `PUBLIC_URL`
+- `ADMIN_SETUP_CODE`
 
-Переменные окружения:
-- `BOT_TOKEN` — токен бота из BotFather
-- `ADMIN_SETUP_CODE` — секретный код для `/setadmin`
-- `TELEGRAM_WEBHOOK_SECRET` — секрет webhook
-- `PUBLIC_URL` — публичный URL Railway
-- `DB_PATH` — необязательно; путь к SQLite, по умолчанию `orders.sqlite3`
-
-## Первый запуск
-
-1. Задеплойте `main.py` на Railway.
-2. Задайте переменные окружения.
-3. Откройте бота и отправьте `/setadmin ВАШ_ADMIN_SETUP_CODE`.
-4. После привязки администратора новые заявки будут приходить в этот Telegram-чат.
-
-Токен бота и секреты не публикуйте в GitHub.
+Канал в Mini App открывается кнопкой «Перейти в Telegram-канал» и пунктом «Наш Telegram-канал» в профиле.
