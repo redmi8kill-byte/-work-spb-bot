@@ -153,6 +153,52 @@ async def checkout(order: Order):
     return {"ok": True, "order_id": order_id, "total": total, "notified": bool(BOT_TOKEN and admin), "message": "Заявка отправлена! Мы свяжемся с вами для подтверждения."}
 
 
+async def admin_panel(chat_id: str):
+    if str(chat_id) != str(get_admin_chat_id()):
+        return
+
+    con = db()
+
+    total_orders = con.execute(
+        "SELECT COUNT(*) FROM orders"
+    ).fetchone()[0]
+
+    total_revenue = con.execute(
+        "SELECT COALESCE(SUM(total), 0) FROM orders"
+    ).fetchone()[0]
+
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    today_orders = con.execute(
+        "SELECT COUNT(*) FROM orders WHERE created_at LIKE ?",
+        (today + "%",)
+    ).fetchone()[0]
+
+    today_revenue = con.execute(
+        "SELECT COALESCE(SUM(total), 0) FROM orders WHERE created_at LIKE ?",
+        (today + "%",)
+    ).fetchone()[0]
+
+    con.close()
+
+    text = (
+        "📊 <b>АДМИН-ПАНЕЛЬ</b>\n\n"
+        f"📦 Всего заявок: <b>{total_orders}</b>\n"
+        f"💰 Общая сумма: <b>{total_revenue:,} ₽</b>\n"
+        f"🗓️ Сегодня заявок: <b>{today_orders}</b>\n"
+        f"💵 Сегодня сумма: <b>{today_revenue:,} ₽</b>"
+    ).replace(",", " ")
+
+    await telegram(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+    )
+
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
     secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "workspb2026")
@@ -174,6 +220,8 @@ async def telegram_webhook(request: Request):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "👋 Добро пожаловать! Нажмите «🛍 Услуги» в меню, чтобы открыть каталог."})
     elif chat_id and text.startswith("/help"):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "🏙 <b>ПРАЙС — размещение вакансий в Санкт-Петербурге</b>\n\n🛍 <b>Услуги</b> — открыть каталог и выбрать тариф.\n📋 Выберите услуги, добавьте их в корзину и отправьте заявку.\n⚡ Быстрая публикация • 📣 продвижение вакансии • 🤖 AI-оформление\n\nЕсли нужна помощь, напишите администратору.", "parse_mode": "HTML"})
+    elif chat_id and text.startswith("/admin"):
+        await admin_panel(str(chat_id))
     return {"ok": True}
 
 
