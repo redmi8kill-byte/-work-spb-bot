@@ -23,6 +23,8 @@ RAILWAY_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
 if not PUBLIC_URL and RAILWAY_DOMAIN:
     PUBLIC_URL = "https://" + RAILWAY_DOMAIN
+if not PUBLIC_URL:
+    PUBLIC_URL = "https://work-spb-bot-production.up.railway.app"
 
 SERVICES = [
     {
@@ -380,6 +382,37 @@ async def telegram_webhook(request: Request):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "👋 Добро пожаловать! Нажмите «🛍 Услуги» в меню, чтобы открыть каталог."})
     elif chat_id and text.startswith("/help"):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "🏙 <b>ПРАЙС — размещение вакансий в Санкт-Петербурге</b>\n\n🛍 <b>Услуги</b> — открыть каталог и выбрать тариф.\n📋 Выберите услуги, добавьте их в корзину и отправьте заявку.\n⚡ Быстрая публикация • 📣 продвижение вакансии • 🤖 AI-оформление\n\nЕсли нужна помощь, напишите администратору.", "parse_mode": "HTML"})
+    elif chat_id and (text.startswith("/broadcast") or (msg.get("caption") or "").strip().startswith("/broadcast")):
+        if str(chat_id) != str(get_admin_chat_id()):
+            await telegram("sendMessage", {"chat_id": chat_id, "text": "⛔ Команда доступна только администратору."})
+        else:
+            source_text = text if text.startswith("/broadcast") else (msg.get("caption") or "").strip()
+            parts = source_text.split(maxsplit=1)
+            broadcast_text = parts[1].strip() if len(parts) > 1 else ""
+            photo = msg.get("photo") or []
+            photo_id = photo[-1].get("file_id") if photo else None
+            if not broadcast_text and not photo_id:
+                await telegram("sendMessage", {"chat_id": chat_id, "text": "📣 Формат:\n\n1) /broadcast текст\n\nили\n\n2) Прикрепи фото и в подписи напиши:\n/broadcast текст\n\nК сообщению автоматически добавится кнопка «🎡 Открыть колесо»."})
+            else:
+                con = db()
+                users = [str(row[0]) for row in con.execute("SELECT telegram_id FROM users ORDER BY started_at ASC").fetchall()]
+                con.close()
+                sent = 0
+                failed = 0
+                keyboard = {"inline_keyboard": [[{"text": "🎡 Открыть колесо", "web_app": {"url": PUBLIC_URL}}]]}
+                for uid in users:
+                    if photo_id:
+                        payload = {"chat_id": uid, "photo": photo_id, "caption": escape(broadcast_text)[:1024], "reply_markup": keyboard}
+                        result = await telegram("sendPhoto", payload)
+                    else:
+                        payload = {"chat_id": uid, "text": escape(broadcast_text), "reply_markup": keyboard}
+                        result = await telegram("sendMessage", payload)
+                    if result and result.get("ok"):
+                        sent += 1
+                    else:
+                        failed += 1
+                    await asyncio.sleep(0.05)
+                await telegram("sendMessage", {"chat_id": chat_id, "text": f"📣 Рассылка завершена.\n\n✅ Доставлено: {sent}\n⚠️ Не доставлено: {failed}\n👥 Всего получателей: {len(users)}"})
     elif chat_id and text.startswith("/paysupport"):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "💳 По вопросам оплаты Stars и возврата средств напишите администратору: @RZTFrong"})
     elif chat_id and text.startswith("/admin"):
