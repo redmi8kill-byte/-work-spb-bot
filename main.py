@@ -172,6 +172,8 @@ async def telegram_webhook(request: Request):
             await telegram("sendMessage", {"chat_id": chat_id, "text": "❌ Неверный код подключения."})
     elif chat_id and text.startswith("/start"):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "👋 Добро пожаловать! Нажмите «🛍 Услуги» в меню, чтобы открыть каталог."})
+    elif chat_id and text.startswith("/help"):
+        await telegram("sendMessage", {"chat_id": chat_id, "text": "🏙 <b>ПРАЙС — размещение вакансий в Санкт-Петербурге</b>\n\n🛍 <b>Услуги</b> — открыть каталог и выбрать тариф.\n📋 Выберите услуги, добавьте их в корзину и отправьте заявку.\n⚡ Быстрая публикация • 📣 продвижение вакансии • 🤖 AI-оформление\n\nЕсли нужна помощь, напишите администратору.", "parse_mode": "HTML"})
     return {"ok": True}
 
 
