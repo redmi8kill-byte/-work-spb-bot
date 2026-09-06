@@ -1,4 +1,5 @@
 import os
+import asyncio
 import sqlite3
 import hmac
 import hashlib
@@ -382,6 +383,29 @@ async def telegram_webhook(request: Request):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "🏙 <b>ПРАЙС — размещение вакансий в Санкт-Петербурге</b>\n\n🛍 <b>Услуги</b> — открыть каталог и выбрать тариф.\n📋 Выберите услуги, добавьте их в корзину и отправьте заявку.\n⚡ Быстрая публикация • 📣 продвижение вакансии • 🤖 AI-оформление\n\nЕсли нужна помощь, напишите администратору.", "parse_mode": "HTML"})
     elif chat_id and text.startswith("/paysupport"):
         await telegram("sendMessage", {"chat_id": chat_id, "text": "💳 По вопросам оплаты Stars и возврата средств напишите администратору: @RZTFrong"})
+    elif chat_id and text.startswith("/broadcast"):
+        if str(chat_id) != str(get_admin_chat_id()):
+            await telegram("sendMessage", {"chat_id": chat_id, "text": "⛔ Команда доступна только администратору."})
+        else:
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip():
+                await telegram("sendMessage", {"chat_id": chat_id, "text": "📣 Формат: /broadcast текст сообщения\n\nНапример: /broadcast 🎡 Колесо удачи уже доступно! Заходи в мини-приложение и попробуй выиграть приз 🎁"})
+            else:
+                broadcast_text = parts[1].strip()
+                con = db()
+                users = [str(row[0]) for row in con.execute("SELECT telegram_id FROM users ORDER BY started_at ASC").fetchall()]
+                con.close()
+                sent = 0
+                failed = 0
+                for uid in users:
+                    result = await telegram("sendMessage", {"chat_id": uid, "text": escape(broadcast_text)})
+                    if result and result.get("ok"):
+                        sent += 1
+                    else:
+                        failed += 1
+                    # Telegram рекомендует ограничивать массовую рассылку; небольшая пауза снижает риск rate limit.
+                    await asyncio.sleep(0.05)
+                await telegram("sendMessage", {"chat_id": chat_id, "text": f"📣 Рассылка завершена.\n\n✅ Доставлено: {sent}\n⚠️ Не доставлено: {failed}\n👥 Всего получателей: {len(users)}"})
     elif chat_id and text.startswith("/admin"):
         await admin_panel(str(chat_id))
     elif chat_id and text.startswith("/orders"):
